@@ -329,7 +329,7 @@ void setup(void)
 	if (getsockname(fd, (struct sockaddr *) &sin, &len) != 0)
 		pdie("getsockname");
 	debug("Bound to local %s:%d\n", inet_ntoa(sin.sin_addr), ntohs(sin.sin_port));
-
+	//创建全新上下文
 	ctx = utp_init(2);
 	assert(ctx);
 	debug("UTP context %p\n", ctx);

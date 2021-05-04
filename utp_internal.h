@@ -115,10 +115,10 @@ struct struct_utp_context {
 	void *userdata;
 	utp_callback_t* callbacks[UTP_ARRAY_SIZE];
 
-	uint64 current_ms;
+	uint64 current_ms; //当前时钟的缓存
 	utp_context_stats context_stats;
 	UTPSocket *last_utp_socket;
-	Array<UTPSocket*> ack_sockets;
+	Array<UTPSocket*> ack_sockets; //等待发送ack的sockets
 	Array<RST_Info> rst_info;
 	UTPSocketHT *utp_sockets;
 	size_t target_delay;

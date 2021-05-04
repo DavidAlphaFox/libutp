@@ -232,7 +232,7 @@ static inline uint64 UTP_GetMicroseconds()
 uint64 utp_default_get_udp_mtu(utp_callback_arguments *args) {
 	// Since we don't know the local address of the interface,
 	// be conservative and assume all IPv6 connections are Teredo.
-	return (args->address->sa_family == AF_INET6) ? UDP_TEREDO_MTU : UDP_IPV4_MTU;
+	return (args->address->sa_family == AF_INET6) ? UDP_TEREDO_MTU : UDP_IPV4_MTU; //默认的MTU
 }
 
 uint64 utp_default_get_udp_overhead(utp_callback_arguments *args) {

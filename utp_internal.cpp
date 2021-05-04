@@ -403,7 +403,7 @@ struct UTPSocket {
 
 	uint16 reorder_count;
 	byte duplicate_ack;
-
+	// 当前需要重新被发送的数据包数量,最旧的数据包应为seq_nr - cur_window_packets
 	// the number of packets in the send queue. Packets that haven't
 	// yet been sent count as well as packets marked as needing resend
 	// the oldest un-acked packet in the send queue is seq_nr - cur_window_packets
@@ -1766,8 +1766,9 @@ size_t UTPSocket::get_packet_size() const
 // as soon as the header is done
 size_t utp_process_incoming(UTPSocket *conn, const byte *packet, size_t len, bool syn = false)
 {
+	//统计信息
 	utp_register_recv_packet(conn, len);
-
+	//记录当前的ms
 	conn->ctx->current_ms = utp_call_get_milliseconds(conn->ctx, conn);
 
 	const PacketFormatV1 *pf1 = (PacketFormatV1*)packet;
@@ -1787,7 +1788,7 @@ size_t utp_process_incoming(UTPSocket *conn, const byte *packet, size_t len, boo
 
 	// mark receipt time
 	uint64 time = utp_call_get_microseconds(conn->ctx, conn);
-
+	// 计算当前窗口大小，从而确定ACK的范围
 	// window packets size is used to calculate a minimum
 	// permissible range for received acks. connections with acks falling
 	// out of this range are dropped
@@ -1804,6 +1805,9 @@ size_t utp_process_incoming(UTPSocket *conn, const byte *packet, size_t len, boo
 	conn->log(UTP_LOG_DEBUG, "Invalid ack_nr: %u. our seq_nr: %u last unacked: %u"
 	, pk_ack_nr, conn->seq_nr, (conn->seq_nr - conn->cur_window_packets) & ACK_NR_MASK);
 #endif
+	//非SYN，且状态不是CS_SYN_RECV
+	//链接的seq_nr要比包中的ack_nr小
+	//包中的ack_nr要比链接中seq_nr - curr_window小，说明已经包已经被ACK了，因此就无需再次处理
 		return 0;
 	}
 
@@ -1827,6 +1831,7 @@ size_t utp_process_incoming(UTPSocket *conn, const byte *packet, size_t len, boo
 	}
 	// Skip the extension headers
 	uint extension = pf1->ext;
+	//处理扩展
 	if (extension != 0) {
 		do {
 			// Verify that the packet is valid.
@@ -1871,11 +1876,12 @@ size_t utp_process_incoming(UTPSocket *conn, const byte *packet, size_t len, boo
 		// if this is a syn-ack, initialize our ack_nr
 		// to match the sequence number we got from
 		// the other end
+		// 如果我们是处在CS_SYN_SENT，那么我们需要设置我们链接的ACK_NR
 		conn->ack_nr = (pk_seq_nr - 1) & SEQ_NR_MASK;
 	}
-
+	//我们最后一次得到数据包的时间
 	conn->last_got_packet = conn->ctx->current_ms;
-
+	//如果是SYN包，处理到此结束
 	if (syn) {
 		return 0;
 	}
@@ -2570,7 +2576,7 @@ void utp_initialize_socket(	utp_socket *conn,
 	conn->log(UTP_LOG_DEBUG, "UTP socket initialized");
 	#endif
 }
-
+//创建utp的socket
 utp_socket*	utp_create_socket(utp_context *ctx)
 {
 	assert(ctx);
@@ -2578,7 +2584,7 @@ utp_socket*	utp_create_socket(utp_context *ctx)
 
 	UTPSocket *conn = new UTPSocket; // TODO: UTPSocket should have a constructor
 
-	conn->state					= CS_UNINITIALIZED;
+	conn->state					= CS_UNINITIALIZED; //设置最初状态
 	conn->ctx					= ctx;
 	conn->userdata				= NULL;
 	conn->reorder_count			= 0;
@@ -2844,7 +2850,7 @@ int utp_process_udp(utp_context *ctx, const byte *buffer, size_t len, const stru
 	ctx->log(UTP_LOG_DEBUG, NULL, "recv %s len:%u id:%u", addrfmt(addr, addrbuf), (uint)len, id);
 	ctx->log(UTP_LOG_DEBUG, NULL, "recv id:%u seq_nr:%u ack_nr:%u", id, (uint)pf1->seq_nr, (uint)pf1->ack_nr);
 	#endif
-
+	//得到包的类型
 	const byte flags = pf1->type();
 
 	if (flags == ST_RESET) {
@@ -2852,7 +2858,7 @@ int utp_process_udp(utp_context *ctx, const byte *buffer, size_t len, const stru
 		// if it's our send id, and we initiated the connection, our recv id is id + 1
 		// if it's our send id, and we did not initiate the connection, our recv id is id - 1
 		// we have to check every case
-
+		//在connection的列表中寻找我们自己
 		UTPSocketKeyData* keyData;
 		if ( (keyData = ctx->utp_sockets->Lookup(UTPSocketKey(addr, id))) ||
 			((keyData = ctx->utp_sockets->Lookup(UTPSocketKey(addr, id + 1))) && keyData->socket->conn_id_send == id) ||
@@ -2863,14 +2869,14 @@ int utp_process_udp(utp_context *ctx, const byte *buffer, size_t len, const stru
 			#if UTP_DEBUG_LOGGING
 			ctx->log(UTP_LOG_DEBUG, NULL, "recv RST for existing connection");
 			#endif
-
+			//如果connection的状态是close_requested，那么直接进入DESTROY
 			if (conn->close_requested)
 				conn->state = CS_DESTROY;
 			else
 				conn->state = CS_RESET;
 
 			utp_call_on_overhead_statistics(conn->ctx, conn, false, len + conn->get_udp_overhead(), close_overhead);
-			const int err = (conn->state == CS_SYN_SENT) ? UTP_ECONNREFUSED : UTP_ECONNRESET;
+			const int err = (conn->state == CS_SYN_SENT) ? UTP_ECONNREFUSED : UTP_ECONNRESET; //设置错误码
 			utp_call_on_error(conn->ctx, conn, err);
 		}
 		else {
@@ -2880,9 +2886,9 @@ int utp_process_udp(utp_context *ctx, const byte *buffer, size_t len, const stru
 		}
 		return 1;
 	}
-	else if (flags != ST_SYN) {
+	else if (flags != ST_SYN) { //如果不是SYN包
 		UTPSocket* conn = NULL;
-
+		//获得utp链接信息，这里面使用了缓存
 		if (ctx->last_utp_socket && ctx->last_utp_socket->addr == addr && ctx->last_utp_socket->conn_id_recv == id) {
 			conn = ctx->last_utp_socket;
 		} else {
@@ -2898,7 +2904,7 @@ int utp_process_udp(utp_context *ctx, const byte *buffer, size_t len, const stru
 			#if UTP_DEBUG_LOGGING
 			ctx->log(UTP_LOG_DEBUG, NULL, "recv processing");
 			#endif
-
+			//处理utp包
 			const size_t read = utp_process_incoming(conn, buffer, len);
 			utp_call_on_overhead_statistics(conn->ctx, conn, false, (len - read) + conn->get_udp_overhead(), header_overhead);
 			return 1;
@@ -2907,9 +2913,9 @@ int utp_process_udp(utp_context *ctx, const byte *buffer, size_t len, const stru
 
 	// We have not found a matching utp_socket, and this isn't a SYN.  Reject it.
 	const uint32 seq_nr = pf1->seq_nr;
-	if (flags != ST_SYN) {
+	if (flags != ST_SYN) { //非链接包
 		ctx->current_ms = utp_call_get_milliseconds(ctx, NULL);
-
+		//已经发送了一个RST包
 		for (size_t i = 0; i < ctx->rst_info.GetCount(); i++) {
 			if ((ctx->rst_info[i].connid == id)   &&
 				(ctx->rst_info[i].addr   == addr) &&
@@ -2943,7 +2949,7 @@ int utp_process_udp(utp_context *ctx, const byte *buffer, size_t len, const stru
 		r.connid = id;
 		r.ack_nr = seq_nr;
 		r.timestamp = ctx->current_ms;
-
+		//发送RST信息
 		UTPSocket::send_rst(ctx, addr, id, seq_nr, utp_call_get_random(ctx, NULL));
 		return 1;
 	}
@@ -2981,23 +2987,23 @@ int utp_process_udp(utp_context *ctx, const byte *buffer, size_t len, const stru
 
 			return 1;
 		}
-
+		//创建一个全新的链接
 		// Create a new UTP socket to handle this new connection
 		UTPSocket *conn = utp_create_socket(ctx);
-		utp_initialize_socket(conn, to, tolen, false, id, id+1, id);
+		utp_initialize_socket(conn, to, tolen, false, id, id+1, id); //初始化该链接
 		conn->ack_nr = seq_nr;
 		conn->seq_nr = utp_call_get_random(ctx, NULL);
 		conn->fast_resend_seq_nr = conn->seq_nr;
-		conn->state = CS_SYN_RECV;
-
+		conn->state = CS_SYN_RECV; //更新状态
+		//处理SYN包
 		const size_t read = utp_process_incoming(conn, buffer, len, true);
 
 		#if UTP_DEBUG_LOGGING
 		ctx->log(UTP_LOG_DEBUG, NULL, "recv send connect ACK");
 		#endif
-
+		//发送ACK
 		conn->send_ack(true);
-
+		//链接成功，回调相应函数
 		utp_call_on_accept(ctx, conn, to, tolen);
 
 		// we report overhead after on_accept(), because the callbacks are setup now
@@ -3356,7 +3362,7 @@ int utp_get_delays(UTPSocket *conn, uint32 *ours, uint32 *theirs, uint32 *age)
 // It is not valid for the upper layer to refer to socket after it is closed.
 // Data will keep to try being delivered after the close.
 void utp_close(UTPSocket *conn)
-{
+{  //上层直接关闭utp的socket
 	assert(conn);
 	if (!conn) return;
 
@@ -3370,17 +3376,17 @@ void utp_close(UTPSocket *conn)
 	switch(conn->state) {
 	case CS_CONNECTED:
 	case CS_CONNECTED_FULL:
-		conn->read_shutdown = true;
-		conn->close_requested = true;
-		if (!conn->fin_sent) {
+		conn->read_shutdown = true; //关闭读状态
+		conn->close_requested = true; //记录关闭请求
+		if (!conn->fin_sent) { //如果没发送FIN包，立刻发送一个FIN包
 			conn->fin_sent = true;
 			conn->write_outgoing_packet(0, ST_FIN, NULL, 0);
 		} else if (conn->fin_sent_acked) {
-			conn->state = CS_DESTROY;
+			conn->state = CS_DESTROY; //如果FIN包已经被应答了，则进入DESTROY状态
 		}
 		break;
 
-	case CS_SYN_SENT:
+	case CS_SYN_SENT: //刚刚发送了SYN包，那么立刻更新RTO，然后进入DESTROY状态
 		conn->rto_timeout = utp_call_get_milliseconds(conn->ctx, conn) + min<uint>(conn->rto * 2, 60);
 		// fall through
 	case CS_SYN_RECV:
