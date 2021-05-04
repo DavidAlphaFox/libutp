@@ -714,6 +714,7 @@ void send_to_addr(utp_context *ctx, const byte *p, size_t len, const PackedSockA
 
 void UTPSocket::schedule_ack()
 {
+	//将自己放到发送序列中去就结束了
 	if (ida == -1){
 		#if UTP_DEBUG_LOGGING
 		log(UTP_LOG_DEBUG, "schedule_ack");
@@ -838,7 +839,7 @@ void UTPSocket::send_keep_alive()
 	#if UTP_DEBUG_LOGGING
 	log(UTP_LOG_DEBUG, "Sending KeepAlive ACK %u [%u]", ack_nr, conn_id_send);
 	#endif
-
+	//发送一个ack包
 	send_ack();
 	ack_nr++;
 }
@@ -963,7 +964,7 @@ bool UTPSocket::is_full(int bytes)
 bool UTPSocket::flush_packets()
 {
 	size_t packet_size = get_packet_size();
-
+	//全力向外发送
 	// send packets that are waiting on the pacer to be sent
 	// i has to be an unsigned 16 bit counter to wrap correctly
 	// signed types are not guaranteed to wrap the way you expect
@@ -1130,7 +1131,7 @@ void UTPSocket::check_timeouts()
 			 (int)(rto_timeout - ctx->current_ms), (uint)max_window, (uint)cur_window,
 			 statenames[state], cur_window_packets);
 	#endif
-
+	//如果是DSTROY了，清理包
 	if (state != CS_DESTROY) flush_packets();
 
 	switch (state) {
@@ -1140,15 +1141,16 @@ void UTPSocket::check_timeouts()
 	case CS_CONNECTED: {
 
 		// Reset max window...
+		// 如果出现zerowindow了，重新设置接收方的Window
 		if ((int)(ctx->current_ms - zerowindow_time) >= 0 && max_window_user == 0) {
 			max_window_user = PACKET_SIZE;
 		}
 
 		if ((int)(ctx->current_ms - rto_timeout) >= 0
-			&& rto_timeout > 0) {
+			&& rto_timeout > 0) { //需要进行重传
 
 			bool ignore_loss = false;
-
+			// mtu的探测包丢失了
 			if (cur_window_packets == 1
 				&& ((seq_nr - 1) & ACK_NR_MASK) == mtu_probe_seq
 				&& mtu_probe_seq != 0) {
@@ -1174,32 +1176,32 @@ void UTPSocket::check_timeouts()
 			if (pkt->transmissions >= 4)
 				rtt = 0;
 			*/
-
+			//如果是mtu探测包，就不进行RTO翻倍
 			// Increase RTO
 			const uint new_timeout = ignore_loss ? retransmit_timeout : retransmit_timeout * 2;
 
 			// They initiated the connection but failed to respond before the rto. 
 			// A malicious client can also spoof the destination address of a ST_SYN bringing us to this state.
 			// Kill the connection and do not notify the upper layer
-			if (state == CS_SYN_RECV) {
+			if (state == CS_SYN_RECV) { //链接建立失败了，因为在RTO时间内，我们还没收到DATA
 				state = CS_DESTROY;
 				utp_call_on_error(ctx, this, UTP_ETIMEDOUT);
 				return;
 			}
-
+			//我们建立的链接，但是已经重传了2次，或者进行了4次数据重传
 			// We initiated the connection but the other side failed to respond before the rto
 			if (retransmit_count >= 4 || (state == CS_SYN_SENT && retransmit_count >= 2)) {
 				// 4 consecutive transmissions have timed out. Kill it. If we
 				// haven't even connected yet, give up after only 2 consecutive
 				// failed transmissions.
-				if (close_requested)
+				if (close_requested) //根据是否关闭，我们改变状态
 					state = CS_DESTROY;
 				else
 					state = CS_RESET;
 				utp_call_on_error(ctx, this, UTP_ETIMEDOUT);
 				return;
 			}
-
+			//更新RTO的时间
 			retransmit_timeout = new_timeout;
 			rto_timeout = ctx->current_ms + new_timeout;
 
@@ -1215,6 +1217,7 @@ void UTPSocket::check_timeouts()
 					// idling. No need to be aggressive about resetting the
 					// congestion window. Just let it decay by a 3:rd.
 					// don't set it any lower than the packet size though
+					// 没有数据发送，我们将减小发送窗口
 					max_window = max(max_window * 2 / 3, size_t(packet_size));
 				} else {
 					// our delay was so high that our congestion window
@@ -1222,11 +1225,12 @@ void UTPSocket::check_timeouts()
 					// sending anything for one time-out period. Now, reset
 					// the congestion window to fit one packet, to start over
 					// again
+					// 重置窗口，进行慢启动
 					max_window = packet_size;
 					slow_start = true;
 				}
 			}
-
+			// 我们可以认为所有的packet都已经丢失了
 			// every packet should be considered lost
 			for (int i = 0; i < cur_window_packets; ++i) {
 				OutgoingPacket *pkt = (OutgoingPacket*)outbuf.get(seq_nr - i - 1);
@@ -1235,7 +1239,7 @@ void UTPSocket::check_timeouts()
 				assert(cur_window >= pkt->payload);
 				cur_window -= pkt->payload;
 			}
-
+			//如果当前窗口不为0，将重传数量增加
 			if (cur_window_packets > 0) {
 				retransmit_count++;
 				// used in parse_log.py
@@ -1249,7 +1253,7 @@ void UTPSocket::check_timeouts()
 
 				OutgoingPacket *pkt = (OutgoingPacket*)outbuf.get(seq_nr - cur_window_packets);
 				assert(pkt);
-
+				//立刻重传最老的一个包
 				// Re-send the packet.
 				send_packet(pkt);
 			}
@@ -1260,14 +1264,14 @@ void UTPSocket::check_timeouts()
 		// in case it isn't
 		if (state == CS_CONNECTED_FULL && !is_full()) {
 			state = CS_CONNECTED;
-
+			//我们从全满状态，恢复到常态
 			#if UTP_DEBUG_LOGGING
 			log(UTP_LOG_DEBUG, "Socket writable. max_window:%u cur_window:%u packet_size:%u",
 				(uint)max_window, (uint)cur_window, (uint)get_packet_size());
 			#endif
 			utp_call_on_state_change(this->ctx, this, UTP_STATE_WRITABLE);
 		}
-
+		// 发送心跳包
 		if (state >= CS_CONNECTED && !fin_sent) {
 			if ((int)(ctx->current_ms - last_sent_packet) >= KEEPALIVE_INTERVAL) {
 				send_keep_alive();
@@ -1891,10 +1895,12 @@ size_t utp_process_incoming(UTPSocket *conn, const byte *packet, size_t len, boo
 	// current. Subtracring 1 makes 0 mean "this is the next
 	// expected packet".
 	const uint seqnr = (pk_seq_nr - conn->ack_nr - 1) & SEQ_NR_MASK;
-
+	//  65528   =       65535 - 6 - 1
+	//  65532   =       65535 - 2 - 1
 	// Getting an invalid sequence number?
-	if (seqnr >= REORDER_BUFFER_MAX_SIZE) {
+	if (seqnr >= REORDER_BUFFER_MAX_SIZE) { //超过乱序队列的大小
 		if (seqnr >= (SEQ_NR_MASK + 1) - REORDER_BUFFER_MAX_SIZE && pk_flags != ST_STATE) {
+			//        65532 = 65535 + 1 - 4
 			conn->schedule_ack();
 		}
 
@@ -1907,6 +1913,7 @@ size_t utp_process_incoming(UTPSocket *conn, const byte *packet, size_t len, boo
 
 	// Process acknowledgment
 	// acks is the number of packets that was acked
+	// 计算对方已经收到了多少个包
 	int acks = (pk_ack_nr - (conn->seq_nr - 1 - conn->cur_window_packets)) & ACK_NR_MASK;
 
 	// this happens when we receive an old ack nr
@@ -1928,7 +1935,7 @@ size_t utp_process_incoming(UTPSocket *conn, const byte *packet, size_t len, boo
 	if (conn->cur_window_packets > 0) {
 		if (pk_ack_nr == ((conn->seq_nr - conn->cur_window_packets - 1) & ACK_NR_MASK)
 			&& conn->cur_window_packets > 0
-			&& pk_flags == ST_STATE) {
+			&& pk_flags == ST_STATE) {//STATE包，curr_window > 0 且都应答了
 			++conn->duplicate_ack;
 			if (conn->duplicate_ack == DUPLICATE_ACKS_BEFORE_RESEND && conn->mtu_probe_seq) {
 				// It's likely that the probe was rejected due to its size, but we haven't got an
@@ -1971,14 +1978,14 @@ size_t utp_process_incoming(UTPSocket *conn, const byte *packet, size_t len, boo
 		OutgoingPacket *pkt = (OutgoingPacket*)conn->outbuf.get(seq);
 		if (pkt == 0 || pkt->transmissions == 0) continue;
 		assert((int)(pkt->payload) >= 0);
-		acked_bytes += pkt->payload;
+		acked_bytes += pkt->payload; //计算已经被acked的字节数
 		if (conn->mtu_probe_seq && seq == conn->mtu_probe_seq) {
 			conn->mtu_floor = conn->mtu_probe_size;
 			conn->mtu_search_update();
 			conn->log(UTP_LOG_MTU, "MTU [ACK] floor:%d ceiling:%d current:%d"
 				, conn->mtu_floor, conn->mtu_ceiling, conn->mtu_last);
 		}
-
+		//计算最小的rtt
 		// in case our clock is not monotonic
 		if (pkt->time_sent < now)
 			min_rtt = min<int64>(min_rtt, now - pkt->time_sent);
@@ -2004,7 +2011,7 @@ size_t utp_process_incoming(UTPSocket *conn, const byte *packet, size_t len, boo
 
 	// get delay in both directions
 	// record the delay to report back
-	const uint32 their_delay = (uint32)(p == 0 ? 0 : time - p);
+	const uint32 their_delay = (uint32)(p == 0 ? 0 : time - p); //计算到对方的延迟，time是收到包的时间，p是对方的发包时间
 	conn->reply_micro = their_delay;
 	uint32 prev_delay_base = conn->their_hist.delay_base;
 	if (their_delay != 0) conn->their_hist.add_sample(their_delay, conn->ctx->current_ms);
@@ -2019,8 +2026,8 @@ size_t utp_process_incoming(UTPSocket *conn, const byte *packet, size_t len, boo
 			conn->our_hist.shift(prev_delay_base - conn->their_hist.delay_base);
 		}
 	}
-
-	const uint32 actual_delay = (uint32(pf1->reply_micro)==INT_MAX?0:uint32(pf1->reply_micro));
+	//如果对面没有设置reply_micro
+	const uint32 actual_delay = (uint32(pf1->reply_micro) == INT_MAX ? 0 : uint32(pf1->reply_micro));
 
 	// if the actual delay is 0, it means the other end
 	// hasn't received a sample from us yet, and doesn't
@@ -2142,17 +2149,17 @@ size_t utp_process_incoming(UTPSocket *conn, const byte *packet, size_t len, boo
 	// only apply the congestion controller on acks
 	// if we don't have a delay measurement, there's
 	// no point in invoking the congestion control
-	if (actual_delay != 0 && acked_bytes >= 1)
+	if (actual_delay != 0 && acked_bytes >= 1) //如果我们确认过的数据大于1，我们就进行流控
 		conn->apply_ccontrol(acked_bytes, actual_delay, min_rtt);
 
 	// sanity check, the other end should never ack packets
 	// past the point we've sent
-	if (acks <= conn->cur_window_packets) {
-		conn->max_window_user = pf1->windowsize;
+	if (acks <= conn->cur_window_packets) { //如果acks的数量等于或小于当前窗口
+		conn->max_window_user = pf1->windowsize; //记录对端的窗口
 
 		// If max user window is set to 0, then we startup a timer
 		// That will reset it to 1 after 15 seconds.
-		if (conn->max_window_user == 0)
+		if (conn->max_window_user == 0) //对端窗口满了，我们需要停下15s
 			// Reset max_window_user to 1 every 15 seconds.
 			conn->zerowindow_time = conn->ctx->current_ms + 15000;
 
@@ -2160,12 +2167,12 @@ size_t utp_process_incoming(UTPSocket *conn, const byte *packet, size_t len, boo
 		// Switch to CONNECTED state.
 		// If this is an ack and we're in still handshaking
 		// transition over to the connected state.
-
+		// 真正的数据进入，变更状态
 		// Incoming connection completion
 		if (pk_flags == ST_DATA && conn->state == CS_SYN_RECV) {
 			conn->state = CS_CONNECTED;
 		}
-
+		// 链接成功了，变更状态
 		// Outgoing connection completion
 		if (pk_flags == ST_STATE && conn->state == CS_SYN_SENT)	{
 			conn->state = CS_CONNECTED;
@@ -2182,12 +2189,12 @@ size_t utp_process_incoming(UTPSocket *conn, const byte *packet, size_t len, boo
 		// cur_window_packets == acks means that this packet acked all 
 		// the remaining packets that were in-flight.
 		} else if (conn->fin_sent && conn->cur_window_packets == acks) {
-			conn->fin_sent_acked = true;
-			if (conn->close_requested) {
+			conn->fin_sent_acked = true; //如果发送了FIN，并且ACKS的包和窗口相同，我们直接设置FIN_SENT_ACKED
+			if (conn->close_requested) { //如果已经要求关闭，那么直接进入DSTROY
 				conn->state = CS_DESTROY;
 			}
 		}
-
+		// 更新快速重传的序列号
 		// Update fast resend counter
 		if (wrapping_compare_less(conn->fast_resend_seq_nr
 			, (pk_ack_nr + 1) & ACK_NR_MASK, ACK_NR_MASK))
@@ -2196,7 +2203,7 @@ size_t utp_process_incoming(UTPSocket *conn, const byte *packet, size_t len, boo
 		#if UTP_DEBUG_LOGGING
 		conn->log(UTP_LOG_DEBUG, "fast_resend_seq_nr:%u", conn->fast_resend_seq_nr);
 		#endif
-
+		//对包进行ack
 		for (int i = 0; i < acks; ++i) {
 			int ack_status = conn->ack_packet(conn->seq_nr - conn->cur_window_packets);
 			// if ack_status is 0, the packet was acked.
@@ -2232,6 +2239,7 @@ size_t utp_process_incoming(UTPSocket *conn, const byte *packet, size_t len, boo
 		// in the send queue
 		// this is especially likely to happen when the other end
 		// has the EACK send bug older versions of uTP had
+		// 处理掉所有被EACK所ACK掉的包
 		while (conn->cur_window_packets > 0 && !conn->outbuf.get(conn->seq_nr - conn->cur_window_packets)) {
 			conn->cur_window_packets--;
 
@@ -2248,7 +2256,7 @@ size_t utp_process_incoming(UTPSocket *conn, const byte *packet, size_t len, boo
 
 		// this invariant should always be true
 		assert(conn->cur_window_packets == 0 || conn->outbuf.get(conn->seq_nr - conn->cur_window_packets));
-
+		// 尝试快速重传第一个包
 		// flush Nagle
 		if (conn->cur_window_packets == 1) {
 			OutgoingPacket *pkt = (OutgoingPacket*)conn->outbuf.get(conn->seq_nr - 1);
@@ -2272,6 +2280,7 @@ size_t utp_process_incoming(UTPSocket *conn, const byte *packet, size_t len, boo
 			} else {
 				// resend the oldest packet and increment fast_resend_seq_nr
 				// to not allow another fast resend on it again
+				// 快速重传最老的包
 				OutgoingPacket *pkt = (OutgoingPacket*)conn->outbuf.get(conn->seq_nr - conn->cur_window_packets);
 				if (pkt && pkt->transmissions > 0) {
 
@@ -2289,7 +2298,7 @@ size_t utp_process_incoming(UTPSocket *conn, const byte *packet, size_t len, boo
 			}
 		}
 	}
-
+	// 处理SACK
 	// Process selective acknowledgent
 	if (selack_ptr != NULL) {
 		conn->selective_ack(pk_ack_nr + 2, selack_ptr, selack_ptr[-1]);
@@ -2313,12 +2322,12 @@ size_t utp_process_incoming(UTPSocket *conn, const byte *packet, size_t len, boo
 		#endif
 		utp_call_on_state_change(conn->ctx, conn, UTP_STATE_WRITABLE);
 	}
-
+	//如果是个STATE的包，处理到此为止
 	if (pk_flags == ST_STATE) {
 		// This is a state packet only.
 		return 0;
 	}
-
+	//链接尚未完全建立，处理到此为止
 	// The connection is not in a state that can accept data?
 	if (conn->state != CS_CONNECTED &&
 		conn->state != CS_CONNECTED_FULL) {
@@ -2327,11 +2336,11 @@ size_t utp_process_incoming(UTPSocket *conn, const byte *packet, size_t len, boo
 
 	// Is this a finalize packet?
 	if (pk_flags == ST_FIN && !conn->got_fin) {
-
+		//FIN包，并且我们之前并没见到FIN包
 		#if UTP_DEBUG_LOGGING
 		conn->log(UTP_LOG_DEBUG, "Got FIN eof_pkt:%u", pk_seq_nr);
 		#endif
-
+		//标记我们收到FIN包了
 		conn->got_fin = true;
 		conn->eof_pkt = pk_seq_nr;
 		// at this point, it is possible for the
@@ -2361,17 +2370,17 @@ size_t utp_process_incoming(UTPSocket *conn, const byte *packet, size_t len, boo
 		// Check if the next packet has been received too, but waiting
 		// in the reorder buffer.
 		for (;;) {
-
+			//如果我们收到FIN包，并且ACK_NR和eof_pkt相等
 			if (!conn->got_fin_reached && conn->got_fin && conn->eof_pkt == conn->ack_nr) {
-				conn->got_fin_reached = true;
-				conn->rto_timeout = conn->ctx->current_ms + min<uint>(conn->rto * 3, 60);
+				conn->got_fin_reached = true; //我们已经响应了FIN包
+				conn->rto_timeout = conn->ctx->current_ms + min<uint>(conn->rto * 3, 60); //更新RTO_timeout时间戳
 
 				#if UTP_DEBUG_LOGGING
 				conn->log(UTP_LOG_DEBUG, "Posting EOF");
 				#endif
 
 				utp_call_on_state_change(conn->ctx, conn, UTP_STATE_EOF);
-
+				// 发送FIN的ACK，我们可以开始丢弃发送数据了
 				// if the other end wants to close, ack
 				conn->send_ack();
 
@@ -2406,7 +2415,7 @@ size_t utp_process_incoming(UTPSocket *conn, const byte *packet, size_t len, boo
 			assert(conn->reorder_count > 0);
 			conn->reorder_count--;
 		}
-
+		//发送一个ACK
 		conn->schedule_ack();
 	} else {
 		// Getting an out of order packet.
@@ -2416,7 +2425,7 @@ size_t utp_process_incoming(UTPSocket *conn, const byte *packet, size_t len, boo
 		// is lower than the sequence number of the packet we just received
 		// something is wrong.
 		if (conn->got_fin && pk_seq_nr > conn->eof_pkt) {
-
+			//收到FIN包，且新包的序列号大于了EOF
 			#if UTP_DEBUG_LOGGING
 			conn->log(UTP_LOG_DEBUG, "Got an invalid packet sequence number, past EOF "
 				"reorder_count:%u len:%u (rb:%u)",
@@ -3284,7 +3293,7 @@ void utp_check_timeouts(utp_context *ctx)
 {
 	assert(ctx);
 	if (!ctx) return;
-
+	//更新时间戳
 	ctx->current_ms = utp_call_get_milliseconds(ctx, NULL);
 
 	if (ctx->current_ms - ctx->last_check < TIMEOUT_CHECK_INTERVAL)
@@ -3301,7 +3310,7 @@ void utp_check_timeouts(utp_context *ctx)
 	if (ctx->rst_info.GetCount() != ctx->rst_info.GetAlloc()) {
 		ctx->rst_info.Compact();
 	}
-
+	//逐个检查超时
 	utp_hash_iterator_t it;
 	UTPSocketKeyData* keyData;
 	while ((keyData = ctx->utp_sockets->Iterate(it))) {
