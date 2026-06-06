@@ -1,7 +1,11 @@
+// 延迟历史测试
+// 验证延迟样本的采集、基线计算和时间戳处理
+// 确保拥塞控制的延迟测量机制正确工作
+
 #include <catch2/catch_test_macros.hpp>
 #include "utp/delay_history.hpp"
 
-TEST_CASE("DelayHistory initial state", "[delay]") {
+TEST_CASE("DelayHistory 初始状态", "[delay]") {
     utp::DelayHistory dh;
     dh.clear(1000);
     REQUIRE(dh.delay_base == 0);
@@ -9,14 +13,14 @@ TEST_CASE("DelayHistory initial state", "[delay]") {
     REQUIRE(dh.get_value() == 0);
 }
 
-TEST_CASE("DelayHistory add_sample", "[delay]") {
+TEST_CASE("DelayHistory 添加样本", "[delay]") {
     utp::DelayHistory dh;
     dh.clear(1000);
     dh.add_sample(100, 1000);
     REQUIRE(dh.get_value() == 0);
 }
 
-TEST_CASE("DelayHistory multiple samples", "[delay]") {
+TEST_CASE("DelayHistory 多个样本", "[delay]") {
     utp::DelayHistory dh;
     dh.clear(1000);
 
@@ -27,7 +31,7 @@ TEST_CASE("DelayHistory multiple samples", "[delay]") {
     REQUIRE(dh.get_value() == 0);
 }
 
-TEST_CASE("DelayHistory get_value after samples", "[delay]") {
+TEST_CASE("DelayHistory 添加样本后获取值", "[delay]") {
     utp::DelayHistory dh;
     dh.clear(1000);
 
@@ -38,7 +42,7 @@ TEST_CASE("DelayHistory get_value after samples", "[delay]") {
     REQUIRE(dh.get_value() >= 0);
 }
 
-TEST_CASE("DelayHistory wrapping timestamp handling", "[delay]") {
+TEST_CASE("DelayHistory 时间戳回绕处理", "[delay]") {
     utp::DelayHistory dh;
     dh.clear(1000);
 
@@ -48,7 +52,7 @@ TEST_CASE("DelayHistory wrapping timestamp handling", "[delay]") {
     REQUIRE(dh.delay_base_initialized == true);
 }
 
-TEST_CASE("DelayHistory shift updates delay base", "[delay]") {
+TEST_CASE("DelayHistory shift 更新延迟基线", "[delay]") {
     utp::DelayHistory dh;
     dh.clear(1000);
 
@@ -60,7 +64,7 @@ TEST_CASE("DelayHistory shift updates delay base", "[delay]") {
     REQUIRE(dh.delay_base == old_delay_base + 100);
 }
 
-TEST_CASE("DelayHistory clear resets state", "[delay]") {
+TEST_CASE("DelayHistory clear 重置状态", "[delay]") {
     utp::DelayHistory dh;
     dh.clear(1000);
     dh.add_sample(500, 1000);
