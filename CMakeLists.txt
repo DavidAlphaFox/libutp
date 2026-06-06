@@ -1,3 +1,7 @@
+# uTP (Micro Transport Protocol) 库根构建配置
+# libutp: 在 UDP 之上实现的 TCP 协议，用于 P2P 传输
+# 使用 CMake 3.25+，支持 C 和 C++（C23 和 C++23 标准）
+
 cmake_minimum_required(VERSION 3.25)
 
 project(libutp
@@ -6,7 +10,7 @@ project(libutp
     DESCRIPTION "uTP (Micro Transport Protocol) library"
 )
 
-# ── C++ standard ──────────────────────────────────────────────
+# ── C++ 标准 ──────────────────────────────────────────────
 set(CMAKE_CXX_STANDARD 23)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
@@ -14,22 +18,22 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_C_STANDARD_REQUIRED ON)
 
-# ── Options ───────────────────────────────────────────────────
-option(UTP_BUILD_SHARED     "Build shared library instead of static" OFF)
-option(UTP_BUILD_EXAMPLES   "Build example programs (ucat)"         ON)
-option(UTP_DEBUG_LOGGING    "Enable verbose debug logging"          OFF)
-option(UTP_ENABLE_STATS     "Enable utp_get_stats() and extra checks" OFF)
+# ── 构建选项 ───────────────────────────────────────────────────
+option(UTP_BUILD_SHARED     "构建动态库而非静态库" OFF)
+option(UTP_BUILD_EXAMPLES   "构建示例程序（ucat）"         ON)
+option(UTP_DEBUG_LOGGING    "启用详细调试日志"          OFF)
+option(UTP_ENABLE_STATS     "启用 utp_get_stats() 和额外检查" OFF)
 
-# ── Library ───────────────────────────────────────────────────
+# ── 库 ───────────────────────────────────────────────────
 add_subdirectory(src)
 
-# ── Examples ──────────────────────────────────────────────────
+# ── 示例 ──────────────────────────────────────────────────
 if(UTP_BUILD_EXAMPLES)
     add_subdirectory(examples)
 endif()
 
-# ── Testing ───────────────────────────────────────────────────
-option(BUILD_TESTING "Build tests" ON)
+# ── 测试 ───────────────────────────────────────────────────
+option(BUILD_TESTING "构建测试" ON)
 if(BUILD_TESTING)
     enable_testing()
     add_subdirectory(tests)

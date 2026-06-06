@@ -1,4 +1,4 @@
-# ── Source files ───────────────────────────────────────────────
+# ── 源文件列表 ───────────────────────────────────────────────
 set(UTP_SOURCES
     utp_api.cpp
     utp_callbacks.cpp
@@ -19,13 +19,13 @@ set(UTP_HEADERS_INTERNAL
     utp_utils.h
 )
 
-# Windows-specific source (only compiled on WIN32)
+# Windows 特定源文件（仅在 WIN32 平台编译）
 if(WIN32)
     list(APPEND UTP_SOURCES libutp_inet_ntop.cpp)
     list(APPEND UTP_HEADERS_INTERNAL libutp_inet_ntop.h)
 endif()
 
-# ── Library target ────────────────────────────────────────────
+# ── 库目标 ────────────────────────────────────────────
 add_library(utp ${UTP_SOURCES})
 
 set_target_properties(utp PROPERTIES
@@ -35,16 +35,16 @@ set_target_properties(utp PROPERTIES
     POSITION_INDEPENDENT_CODE ON
 )
 
-# Shared vs static
+# 动态库 vs 静态库
 if(UTP_BUILD_SHARED)
     set_target_properties(utp PROPERTIES
         WINDOWS_EXPORT_ALL_SYMBOLS ON
     )
 endif()
 
-# ── Include directories ───────────────────────────────────────
-# PUBLIC:  include/   → consumers use #include "utp.h"
-# PRIVATE: src/       → internal headers like "utp_types.h"
+# ── 包含目录 ───────────────────────────────────────
+# PUBLIC:  include/   → 使用者使用 #include "utp.h"
+# PRIVATE: src/       → 内部头文件如 "utp_types.h"
 target_include_directories(utp
     PUBLIC
         $<BUILD_INTERFACE:${CMAKE_SOURCE_DIR}/include>
@@ -53,7 +53,7 @@ target_include_directories(utp
         ${CMAKE_CURRENT_SOURCE_DIR}
 )
 
-# ── Compile definitions ───────────────────────────────────────
+# ── 编译定义 ───────────────────────────────────────
 target_compile_definitions(utp
     PRIVATE
         $<$<NOT:$<PLATFORM_ID:Windows>>:POSIX>
@@ -61,7 +61,7 @@ target_compile_definitions(utp
         $<$<BOOL:${UTP_DEBUG_LOGGING}>:UTP_DEBUG_LOGGING>
 )
 
-# ── Link libraries ────────────────────────────────────────────
+# ── 链接库 ────────────────────────────────────────────
 if(NOT WIN32)
     include(CheckLibraryExists)
     check_library_exists(rt clock_gettime "" HAVE_RT)
@@ -70,11 +70,11 @@ if(NOT WIN32)
     endif()
 endif()
 
-# ── Warnings ──────────────────────────────────────────────────
+# ── 警告 ──────────────────────────────────────────────────
 include(${CMAKE_SOURCE_DIR}/cmake/CompilerWarnings.cmake)
 utp_set_warnings(utp)
 
-# ── Compiler-specific options ─────────────────────────────────
+# ── 编译器特定选项 ─────────────────────────────────
 if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
     target_compile_options(utp PRIVATE -fno-exceptions -fno-rtti)
 endif()
