@@ -9,3 +9,4 @@ build/
 build-*/
 .sisyphus/
 build_test/
+.idea/

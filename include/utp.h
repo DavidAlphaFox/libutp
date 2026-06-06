@@ -30,8 +30,8 @@ extern "C" {
 #include <stdarg.h>
 #include "utp_types.h"
 
-typedef struct UTPSocket					utp_socket;
-typedef struct struct_utp_context			utp_context;
+typedef struct UtpSocket					utp_socket;
+typedef struct UtpContext					utp_context;
 
 enum {
 	UTP_UDP_DONTFRAG = 2,	// Used to be a #define as UDP_IP_DONTFRAG

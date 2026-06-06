@@ -68,38 +68,38 @@ const char *utp_state_names[] = {
 };
 
 // utp_context 构造函数，初始化上下文
-struct_utp_context::struct_utp_context()
-	: userdata(NULL)
-	, current_ms(0)
-	, last_utp_socket(NULL)
-	, log_normal(false)
-	, log_mtu(false)
-	, log_debug(false)
+UtpContext::UtpContext()
+	: userdata_(NULL)
+	, current_ms_(0)
+	, last_utp_socket_(NULL)
+	, log_normal_(false)
+	, log_mtu_(false)
+	, log_debug_(false)
 {
-	memset(&context_stats, 0, sizeof(context_stats));
-	memset(callbacks, 0, sizeof(callbacks));
-	target_delay = CCONTROL_TARGET;
-	utp_sockets = new UTPSocketHT;
+	memset(&context_stats_, 0, sizeof(context_stats_));
+	memset(callbacks_, 0, sizeof(callbacks_));
+	target_delay_ = CCONTROL_TARGET;
+	utp_sockets_ = new UtpSocketTable;
 
 	// 设置默认回调函数
-	callbacks[UTP_GET_UDP_MTU]      = &utp_default_get_udp_mtu;
-	callbacks[UTP_GET_UDP_OVERHEAD] = &utp_default_get_udp_overhead;
-	callbacks[UTP_GET_MILLISECONDS] = &utp_default_get_milliseconds;
-	callbacks[UTP_GET_MICROSECONDS] = &utp_default_get_microseconds;
-	callbacks[UTP_GET_RANDOM]       = &utp_default_get_random;
+	callbacks_[UTP_GET_UDP_MTU]      = &utp_default_get_udp_mtu;
+	callbacks_[UTP_GET_UDP_OVERHEAD] = &utp_default_get_udp_overhead;
+	callbacks_[UTP_GET_MILLISECONDS] = &utp_default_get_milliseconds;
+	callbacks_[UTP_GET_MICROSECONDS] = &utp_default_get_microseconds;
+	callbacks_[UTP_GET_RANDOM]       = &utp_default_get_random;
 
 	// 1 MB 接收缓冲区（即最大带宽延迟积）
 	// 对于 RTT 为 200ms 的对端，无法以超过 5 MB/s 的速度接收
 	// 对于 RTT 为 10ms 的对端，无法以超过 100 MB/s 的速度接收
 	// 这假设是足够的，因为带宽通常与 RTT 成正比
 	// 在设置下载速率限制时，所有 socket 的接收缓冲区应设置得更低，比如 60 kiB 左右
-	opt_rcvbuf = opt_sndbuf = 1024 * 1024;
-	last_check = 0;
+	opt_rcvbuf_ = opt_sndbuf_ = 1024 * 1024;
+	last_check_ = 0;
 }
 
 // utp_context 析构函数，清理资源
-struct_utp_context::~struct_utp_context() {
-	delete this->utp_sockets;
+UtpContext::~UtpContext() {
+	delete this->utp_sockets_;
 }
 
 // 初始化 uTP 上下文
@@ -127,7 +127,7 @@ void utp_destroy(utp_context *ctx) {
 //       proc - 回调函数指针
 void utp_set_callback(utp_context *ctx, int callback_name, utp_callback_t *proc) {
 	assert(ctx);
-	if (ctx) ctx->callbacks[callback_name] = proc;
+	if (ctx) ctx->callbacks_[callback_name] = proc;
 }
 
 // 设置用户自定义数据
@@ -136,8 +136,8 @@ void utp_set_callback(utp_context *ctx, int callback_name, utp_callback_t *proc)
 // 返回: 之前的用户数据指针
 void* utp_context_set_userdata(utp_context *ctx, void *userdata) {
 	assert(ctx);
-	if (ctx) ctx->userdata = userdata;
-	return ctx ? ctx->userdata : NULL;
+	if (ctx) ctx->userdata_ = userdata;
+	return ctx ? ctx->userdata_ : NULL;
 }
 
 // 获取用户自定义数据
@@ -145,7 +145,7 @@ void* utp_context_set_userdata(utp_context *ctx, void *userdata) {
 // 返回: 用户数据指针
 void* utp_context_get_userdata(utp_context *ctx) {
 	assert(ctx);
-	return ctx ? ctx->userdata : NULL;
+	return ctx ? ctx->userdata_ : NULL;
 }
 
 // 获取上下文统计信息
@@ -153,7 +153,7 @@ void* utp_context_get_userdata(utp_context *ctx) {
 // 返回: 统计信息结构体指针
 utp_context_stats* utp_get_context_stats(utp_context *ctx) {
 	assert(ctx);
-	return ctx ? &ctx->context_stats : NULL;
+	return ctx ? &ctx->context_stats_ : NULL;
 }
 
 // 写入数据到 uTP socket

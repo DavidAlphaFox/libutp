@@ -33,13 +33,13 @@
 int utp_call_on_firewall(utp_context *ctx, const struct sockaddr *address, socklen_t address_len)
 {
 	utp_callback_arguments args;
-	if (!ctx->callbacks[UTP_ON_FIREWALL]) return 0;
+	if (!ctx->callbacks_[UTP_ON_FIREWALL]) return 0;
 	args.callback_type = UTP_ON_FIREWALL;
 	args.context = ctx;
 	args.socket = NULL;
 	args.address = address;
 	args.address_len = address_len;
-	return (int)ctx->callbacks[UTP_ON_FIREWALL](&args);
+	return (int)ctx->callbacks_[UTP_ON_FIREWALL](&args);
 }
 
 // 触发时机：新的入站连接被接受后调用
@@ -47,13 +47,13 @@ int utp_call_on_firewall(utp_context *ctx, const struct sockaddr *address, sockl
 void utp_call_on_accept(utp_context *ctx, utp_socket *socket, const struct sockaddr *address, socklen_t address_len)
 {
 	utp_callback_arguments args;
-	if (!ctx->callbacks[UTP_ON_ACCEPT]) return;
+	if (!ctx->callbacks_[UTP_ON_ACCEPT]) return;
 	args.callback_type = UTP_ON_ACCEPT;
 	args.context = ctx;
 	args.socket = socket;
 	args.address = address;
 	args.address_len = address_len;
-	ctx->callbacks[UTP_ON_ACCEPT](&args);
+	ctx->callbacks_[UTP_ON_ACCEPT](&args);
 }
 
 // 触发时机：出站连接成功建立时调用
@@ -61,11 +61,11 @@ void utp_call_on_accept(utp_context *ctx, utp_socket *socket, const struct socka
 void utp_call_on_connect(utp_context *ctx, utp_socket *socket)
 {
 	utp_callback_arguments args;
-	if (!ctx->callbacks[UTP_ON_CONNECT]) return;
+	if (!ctx->callbacks_[UTP_ON_CONNECT]) return;
 	args.callback_type = UTP_ON_CONNECT;
 	args.context = ctx;
 	args.socket = socket;
-	ctx->callbacks[UTP_ON_CONNECT](&args);
+	ctx->callbacks_[UTP_ON_CONNECT](&args);
 }
 
 // 触发时机：发生错误时调用
@@ -73,12 +73,12 @@ void utp_call_on_connect(utp_context *ctx, utp_socket *socket)
 void utp_call_on_error(utp_context *ctx, utp_socket *socket, int error_code)
 {
 	utp_callback_arguments args;
-	if (!ctx->callbacks[UTP_ON_ERROR]) return;
+	if (!ctx->callbacks_[UTP_ON_ERROR]) return;
 	args.callback_type = UTP_ON_ERROR;
 	args.context = ctx;
 	args.socket = socket;
 	args.error_code = error_code;
-	ctx->callbacks[UTP_ON_ERROR](&args);
+	ctx->callbacks_[UTP_ON_ERROR](&args);
 }
 
 // 触发时机：接收到数据时调用
@@ -86,13 +86,13 @@ void utp_call_on_error(utp_context *ctx, utp_socket *socket, int error_code)
 void utp_call_on_read(utp_context *ctx, utp_socket *socket, const byte *buf, size_t len)
 {
 	utp_callback_arguments args;
-	if (!ctx->callbacks[UTP_ON_READ]) return;
+	if (!ctx->callbacks_[UTP_ON_READ]) return;
 	args.callback_type = UTP_ON_READ;
 	args.context = ctx;
 	args.socket = socket;
 	args.buf = buf;
 	args.len = len;
-	ctx->callbacks[UTP_ON_READ](&args);
+	ctx->callbacks_[UTP_ON_READ](&args);
 }
 
 // 触发时机：协议开销统计信息更新时调用
@@ -100,14 +100,14 @@ void utp_call_on_read(utp_context *ctx, utp_socket *socket, const byte *buf, siz
 void utp_call_on_overhead_statistics(utp_context *ctx, utp_socket *socket, int send, size_t len, int type)
 {
 	utp_callback_arguments args;
-	if (!ctx->callbacks[UTP_ON_OVERHEAD_STATISTICS]) return;
+	if (!ctx->callbacks_[UTP_ON_OVERHEAD_STATISTICS]) return;
 	args.callback_type = UTP_ON_OVERHEAD_STATISTICS;
 	args.context = ctx;
 	args.socket = socket;
 	args.send = send;
 	args.len = len;
 	args.type = type;
-	ctx->callbacks[UTP_ON_OVERHEAD_STATISTICS](&args);
+	ctx->callbacks_[UTP_ON_OVERHEAD_STATISTICS](&args);
 }
 
 // 触发时机：延迟采样完成时调用
@@ -115,12 +115,12 @@ void utp_call_on_overhead_statistics(utp_context *ctx, utp_socket *socket, int s
 void utp_call_on_delay_sample(utp_context *ctx, utp_socket *socket, int sample_ms)
 {
 	utp_callback_arguments args;
-	if (!ctx->callbacks[UTP_ON_DELAY_SAMPLE]) return;
+	if (!ctx->callbacks_[UTP_ON_DELAY_SAMPLE]) return;
 	args.callback_type = UTP_ON_DELAY_SAMPLE;
 	args.context = ctx;
 	args.socket = socket;
 	args.sample_ms = sample_ms;
-	ctx->callbacks[UTP_ON_DELAY_SAMPLE](&args);
+	ctx->callbacks_[UTP_ON_DELAY_SAMPLE](&args);
 }
 
 // 触发时机：socket 状态改变时调用
@@ -128,12 +128,12 @@ void utp_call_on_delay_sample(utp_context *ctx, utp_socket *socket, int sample_m
 void utp_call_on_state_change(utp_context *ctx, utp_socket *socket, int state)
 {
 	utp_callback_arguments args;
-	if (!ctx->callbacks[UTP_ON_STATE_CHANGE]) return;
+	if (!ctx->callbacks_[UTP_ON_STATE_CHANGE]) return;
 	args.callback_type = UTP_ON_STATE_CHANGE;
 	args.context = ctx;
 	args.socket = socket;
 	args.state = state;
-	ctx->callbacks[UTP_ON_STATE_CHANGE](&args);
+	ctx->callbacks_[UTP_ON_STATE_CHANGE](&args);
 }
 
 // 触发时机：需要获取 UDP MTU 时调用
@@ -141,13 +141,13 @@ void utp_call_on_state_change(utp_context *ctx, utp_socket *socket, int state)
 uint16 utp_call_get_udp_mtu(utp_context *ctx, utp_socket *socket, const struct sockaddr *address, socklen_t address_len)
 {
 	utp_callback_arguments args;
-	if (!ctx->callbacks[UTP_GET_UDP_MTU]) return 0;
+	if (!ctx->callbacks_[UTP_GET_UDP_MTU]) return 0;
 	args.callback_type = UTP_GET_UDP_MTU;
 	args.context = ctx;
 	args.socket = socket;
 	args.address = address;
 	args.address_len = address_len;
-	return (uint16)ctx->callbacks[UTP_GET_UDP_MTU](&args);
+	return (uint16)ctx->callbacks_[UTP_GET_UDP_MTU](&args);
 }
 
 // 触发时机：需要获取 UDP 协议开销时调用
@@ -155,13 +155,13 @@ uint16 utp_call_get_udp_mtu(utp_context *ctx, utp_socket *socket, const struct s
 uint16 utp_call_get_udp_overhead(utp_context *ctx, utp_socket *socket, const struct sockaddr *address, socklen_t address_len)
 {
 	utp_callback_arguments args;
-	if (!ctx->callbacks[UTP_GET_UDP_OVERHEAD]) return 0;
+	if (!ctx->callbacks_[UTP_GET_UDP_OVERHEAD]) return 0;
 	args.callback_type = UTP_GET_UDP_OVERHEAD;
 	args.context = ctx;
 	args.socket = socket;
 	args.address = address;
 	args.address_len = address_len;
-	return (uint16)ctx->callbacks[UTP_GET_UDP_OVERHEAD](&args);
+	return (uint16)ctx->callbacks_[UTP_GET_UDP_OVERHEAD](&args);
 }
 
 // 触发时机：需要获取当前时间（毫秒）时调用
@@ -169,11 +169,11 @@ uint16 utp_call_get_udp_overhead(utp_context *ctx, utp_socket *socket, const str
 uint64 utp_call_get_milliseconds(utp_context *ctx, utp_socket *socket)
 {
 	utp_callback_arguments args;
-	if (!ctx->callbacks[UTP_GET_MILLISECONDS]) return 0;
+	if (!ctx->callbacks_[UTP_GET_MILLISECONDS]) return 0;
 	args.callback_type = UTP_GET_MILLISECONDS;
 	args.context = ctx;
 	args.socket = socket;
-	return ctx->callbacks[UTP_GET_MILLISECONDS](&args);
+	return ctx->callbacks_[UTP_GET_MILLISECONDS](&args);
 }
 
 // 触发时机：需要获取当前时间（微秒）时调用
@@ -181,11 +181,11 @@ uint64 utp_call_get_milliseconds(utp_context *ctx, utp_socket *socket)
 uint64 utp_call_get_microseconds(utp_context *ctx, utp_socket *socket)
 {
 	utp_callback_arguments args;
-	if (!ctx->callbacks[UTP_GET_MICROSECONDS]) return 0;
+	if (!ctx->callbacks_[UTP_GET_MICROSECONDS]) return 0;
 	args.callback_type = UTP_GET_MICROSECONDS;
 	args.context = ctx;
 	args.socket = socket;
-	return ctx->callbacks[UTP_GET_MICROSECONDS](&args);
+	return ctx->callbacks_[UTP_GET_MICROSECONDS](&args);
 }
 
 // 触发时机：需要随机数时调用
@@ -193,11 +193,11 @@ uint64 utp_call_get_microseconds(utp_context *ctx, utp_socket *socket)
 uint32 utp_call_get_random(utp_context *ctx, utp_socket *socket)
 {
 	utp_callback_arguments args;
-	if (!ctx->callbacks[UTP_GET_RANDOM]) return 0;
+	if (!ctx->callbacks_[UTP_GET_RANDOM]) return 0;
 	args.callback_type = UTP_GET_RANDOM;
 	args.context = ctx;
 	args.socket = socket;
-	return (uint32)ctx->callbacks[UTP_GET_RANDOM](&args);
+	return (uint32)ctx->callbacks_[UTP_GET_RANDOM](&args);
 }
 
 // 触发时机：需要读取缓冲区大小时调用
@@ -205,11 +205,11 @@ uint32 utp_call_get_random(utp_context *ctx, utp_socket *socket)
 size_t utp_call_get_read_buffer_size(utp_context *ctx, utp_socket *socket)
 {
 	utp_callback_arguments args;
-	if (!ctx->callbacks[UTP_GET_READ_BUFFER_SIZE]) return 0;
+	if (!ctx->callbacks_[UTP_GET_READ_BUFFER_SIZE]) return 0;
 	args.callback_type = UTP_GET_READ_BUFFER_SIZE;
 	args.context = ctx;
 	args.socket = socket;
-	return (size_t)ctx->callbacks[UTP_GET_READ_BUFFER_SIZE](&args);
+	return (size_t)ctx->callbacks_[UTP_GET_READ_BUFFER_SIZE](&args);
 }
 
 // 触发时机：需要输出日志时调用
@@ -217,12 +217,12 @@ size_t utp_call_get_read_buffer_size(utp_context *ctx, utp_socket *socket)
 void utp_call_log(utp_context *ctx, utp_socket *socket, const byte *buf)
 {
 	utp_callback_arguments args;
-	if (!ctx->callbacks[UTP_LOG]) return;
+	if (!ctx->callbacks_[UTP_LOG]) return;
 	args.callback_type = UTP_LOG;
 	args.context = ctx;
 	args.socket = socket;
 	args.buf = buf;
-	ctx->callbacks[UTP_LOG](&args);
+	ctx->callbacks_[UTP_LOG](&args);
 }
 
 // 触发时机：需要发送 UDP 数据包时调用
@@ -230,7 +230,7 @@ void utp_call_log(utp_context *ctx, utp_socket *socket, const byte *buf)
 void utp_call_sendto(utp_context *ctx, utp_socket *socket, const byte *buf, size_t len, const struct sockaddr *address, socklen_t address_len, uint32 flags)
 {
 	utp_callback_arguments args;
-	if (!ctx->callbacks[UTP_SENDTO]) return;
+	if (!ctx->callbacks_[UTP_SENDTO]) return;
 	args.callback_type = UTP_SENDTO;
 	args.context = ctx;
 	args.socket = socket;
@@ -239,6 +239,6 @@ void utp_call_sendto(utp_context *ctx, utp_socket *socket, const byte *buf, size
 	args.address = address;
 	args.address_len = address_len;
 	args.flags = flags;
-	ctx->callbacks[UTP_SENDTO](&args);
+	ctx->callbacks_[UTP_SENDTO](&args);
 }
 
