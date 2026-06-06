@@ -5,7 +5,6 @@ set(UTP_SOURCES
     utp_callbacks_defaults.cpp
     utp_internal.cpp
     utp/address.cpp
-    utp_utils.cpp
 )
 
 set(UTP_HEADERS_PUBLIC
@@ -18,7 +17,6 @@ set(UTP_HEADERS_INTERNAL
     utp_callbacks.hpp
     utp_internal.h
     utp_types.h
-    utp_utils.h
 )
 
 # Windows 特定源文件（仅在 WIN32 平台编译）
