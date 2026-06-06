@@ -36,8 +36,15 @@
 #include "utp_internal.h"
 #include "utp/sequence_buffer.hpp"
 #include "utp/delay_history.hpp"
+#include "utp/wire_format.hpp"
 
 using utp::wrapping_compare_less;
+using utp::wire::PacketFormatV1;
+using utp::wire::PacketFormatAckV1;
+using utp::zeromem;
+using std::min;
+using std::max;
+using std::clamp;
 
 #define	TIMEOUT_CHECK_INTERVAL	500
 
@@ -95,13 +102,6 @@ char addrbuf[65];
 #define addrfmt(x, s) x.fmt(s, sizeof(s))
 
 
-#if (defined(__SVR4) && defined(__sun))
-	#pragma pack(1)
-#else
-	#pragma pack(push,1)
-#endif
-
-
 // these packet sizes are including the uTP header wich
 // is either 20 or 23 bytes depending on version
 #define PACKET_SIZE_EMPTY_BUCKET 0
@@ -113,42 +113,6 @@ char addrbuf[65];
 #define PACKET_SIZE_BIG_BUCKET 3
 #define PACKET_SIZE_BIG 1400
 #define PACKET_SIZE_HUGE_BUCKET 4
-
-struct PACKED_ATTRIBUTE PacketFormatV1 {
-	// packet_type (4 high bits)
-	// protocol version (4 low bits)
-	byte ver_type;
-	byte version() const { return ver_type & 0xf; }
-	byte type() const { return ver_type >> 4; }
-	void set_version(byte v) { ver_type = (ver_type & 0xf0) | (v & 0xf); }
-	void set_type(byte t) { ver_type = (ver_type & 0xf) | (t << 4); }
-
-	// Type of the first extension header
-	byte ext;
-	// connection ID
-	uint16_big connid;
-	uint32_big tv_usec;
-	uint32_big reply_micro;
-	// receive window size in bytes
-	uint32_big windowsize;
-	// Sequence number
-	uint16_big seq_nr;
-	// Acknowledgment number
-	uint16_big ack_nr;
-};
-
-struct PACKED_ATTRIBUTE PacketFormatAckV1 {
-	PacketFormatV1 pf;
-	byte ext_next;
-	byte ext_len;
-	byte acks[4];
-};
-
-#if (defined(__SVR4) && defined(__sun))
-	#pragma pack(0)
-#else
-	#pragma pack(pop)
-#endif
 
 enum {
 	ST_DATA = 0,		// Data packet.
@@ -736,7 +700,7 @@ bool UTPSocket::is_full(int bytes)
 	size_t packet_size = get_packet_size();
 	if (bytes < 0) bytes = packet_size;
 	else if (bytes > (int)packet_size) bytes = (int)packet_size;
-	size_t max_send = min(max_window, opt_sndbuf, max_window_user);
+	size_t max_send = min(min(max_window, opt_sndbuf), max_window_user);
 
 	// subtract one to save space for the FIN packet
 	if (cur_window_packets >= OUTGOING_BUFFER_MAX_SIZE - 1) {

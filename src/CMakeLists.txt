@@ -15,7 +15,6 @@ set(UTP_HEADERS_INTERNAL
     utp_callbacks.h
     utp_internal.h
     utp_packedsockaddr.h
-    utp_templates.h
     utp_types.h
     utp_utils.h
 )

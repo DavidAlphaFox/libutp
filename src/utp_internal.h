@@ -32,7 +32,7 @@
 
 #include "utp.h"
 #include "utp_callbacks.h"
-#include "utp_templates.h"
+#include "utp/endian.hpp"
 #include "utp_packedsockaddr.h"
 
 /* These originally lived in utp_config.h */
