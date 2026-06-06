@@ -5,6 +5,7 @@ set(UTP_SOURCES
     utp_callbacks_defaults.cpp
     utp_internal.cpp
     utp/address.cpp
+    utp/ledbat.cpp
 )
 
 set(UTP_HEADERS_PUBLIC
@@ -15,6 +16,7 @@ set(UTP_HEADERS_INTERNAL
     utp/address.hpp
     utp_callbacks.h
     utp_callbacks.hpp
+    utp/ledbat.hpp
     utp_internal.h
     utp_types.h
 )

@@ -37,6 +37,8 @@
 #include "utp/sequence_buffer.hpp"
 #include "utp/delay_history.hpp"
 #include "utp/wire_format.hpp"
+#include "utp/mtu_discovery.hpp"
+#include "utp/ledbat.hpp"
 
 using utp::wrapping_compare_less;
 using utp::wire::PacketFormatV1;
@@ -211,11 +213,10 @@ struct InboundPacket {
 //   - 连接状态 / FIN / 关闭相关布尔位
 //   - 对端通告窗口 / 状态机当前状态
 //   - 序列号 (ack_nr_ / seq_nr_ / eof_pkt_ / fast_resend_seq_nr_)
-//   - 延迟采样 (reply_micro_ / last_* / clock_drift_ / average_delay_)
-//   - RTT 估算 (rtt / rtt_var / rto / rto_timeout_)
-//   - 拥塞控制 (slow_start_ / ssthresh_ / max_window_)
+//   - 延迟采样 (reply_micro_ / last_*)
+//   - 拥塞控制子组件 (cc_ = LedbatController: 窗口 / RTT / 延迟统计 / 时钟漂移)
 //   - 接收/发送环形缓冲区 (inbuf_ / outbuf_)
-//   - MTU 探测 (mtu_*)
+//   - MTU 探测 (mtu_ = MtuDiscovery)
 //   - 用户数据指针 (userdata_) / 调试统计 (stats_)
 // =============================================================================
 class UtpSocket {
@@ -232,26 +233,17 @@ public:
 	int ida; //for ack socket list
 
 	// -- 计数: 重传、乱序、重复 ACK --
-	uint16 retransmit_count_;
-
 	// reorder_count_: 接收侧等待重排 (尚未按序交付) 的包数,用于决定 ACK 是否带 EACK。
 	uint16 reorder_count_;
 	// duplicate_ack_: 收到的连续重复 ACK 计数,达到阈值时触发快速重传。
 	byte duplicate_ack_;
 	// 当前需要重新被发送的数据包数量,最旧的数据包应为seq_nr_ - cur_window_packets_
 	// the number of packets in the send queue. Packets that haven't
-	// yet been sent count as well as packets marked as needing resend
+	// yet been sent count as well as packets marked as needing to resend
 	// the oldest un-acked packet in the send queue is seq_nr_ - cur_window_packets_
 	uint16 cur_window_packets_;
 
 	// -- 发送/接收窗口: 字节数级别 + 上限配置 --
-	// how much of the window is used, number of bytes in-flight
-	// packets that have not yet been sent do not count, packets
-	// that are marked as needing to be re-sent (due to a timeout)
-	// don't count either
-	size_t cur_window_;
-	// maximum window size, in bytes
-	size_t max_window_;
 	// UTP_SNDBUF setting, in bytes
 	size_t opt_sndbuf_;
 	// UTP_RCVBUF setting, in bytes
@@ -281,12 +273,10 @@ public:
 	// Timeout procedure
 	bool fast_timeout_:1;
 
-	// -- 接收端"对方允许的窗口" / 当前状态机 / 上次降窗时间 --
+	// -- 接收端"对方允许的窗口" / 当前状态机 --
 	// max receive window for other end, in bytes
 	size_t max_window_user_;
 	CONN_STATE state_;
-	// TickCount when we last decayed window (wraps)
-	int64 last_rwin_decay_;
 
 	// -- 序列号空间: 16 位回绕 --
 	// the sequence number of the FIN packet. This field is only set
@@ -319,28 +309,8 @@ public:
 	uint64 last_sent_packet_;
 	uint64 last_measured_delay_;
 
-	// timestamp of the last time the cwnd was full
-	// this is used to prevent the congestion window
-	// from growing when we're not sending at capacity
-	mutable uint64 last_maxed_out_window_;
-
 	// userdata_: 用户通过 utp_set_userdata 关联的自定义数据,供回调使用。
 	void *userdata_;
-
-	// -- RTT 估算 (单位: 毫秒) 与 RTO 计时器 --
-	// Round trip time
-	uint rtt;
-	// Round trip time variance
-	uint rtt_var;
-	// Round trip timeout
-	uint rto;
-	utp::DelayHistory rtt_hist_;
-	// retransmit_timeout_: 当前 RTO 重传退避值,首次超时后翻倍。
-	uint retransmit_timeout_;
-	// The RTO timer will timeout here.
-	uint64 rto_timeout_;
-	// When the window size is set to zero, start this timer. It will send a new packet every 30secs.
-	uint64 zerowindow_time_;
 
 	// -- 连接标识 --
 	uint32 conn_seed_;
@@ -352,52 +322,13 @@ public:
 	size_t last_rcv_win_;
 
 	// -- 双向延迟历史 (用于 LEDBAT 排队延迟估算) --
-	// our_hist_: 对方测得的"我们到对方"的延迟;their_hist_: 我们测得的"对方到我们"的延迟。
-	// 两者相减可估计"我们方向上的排队延迟",作为 LEDBAT 调窗的反馈信号。
-	utp::DelayHistory our_hist_;
-	utp::DelayHistory their_hist_;
 
 	// extension bytes from SYN packet
 	byte extensions_[8];
 
-	// -- MTU 探测 (Path MTU Discovery) --
-	// mtu_discover_time_: 下一次重置 MTU 搜索的截止时间。
-	// time when we should restart the MTU discovery
-	uint64 mtu_discover_time_;
-	// ceiling and floor of binary search. last is the mtu size
-	// we're currently using
-	uint32 mtu_ceiling_, mtu_floor_, mtu_last_;
-	// we only ever have a single probe in flight at any given time.
-	// this is the sequence number of that probe, and the size of
-	// that packet
-	uint32 mtu_probe_seq_, mtu_probe_size_;
-
-	// -- 长时窗延迟统计 (5 秒粒度), 用于检测时钟漂移 --
-	// this is the average delay samples, as compared to the initial
-	// sample. It's averaged over 5 seconds
-	int32 average_delay_;
-	// this is the sum of all the delay samples
-	// we've made recently. The important distinction
-	// of these samples is that they are all made compared
-	// to the initial sample, this is to deal with
-	// wrapping in a simple way.
-	int64 current_delay_sum_;
-	// number of sample ins current_delay_sum_
-	int current_delay_samples_;
-	// initialized to 0, set to the first raw delay sample
-	// each sample that's added to current_delay_sum_
-	// is subtracted from the value first, to make it
-	// a delay relative to this sample
-	uint32 average_delay_base_;
-	// the next time we should add an average delay
-	// sample into average_delay_hist
-	uint64 average_sample_time_;
-	// the estimated clock drift between our computer
-	// and the endpoint computer. The unit is microseconds
-	// per 5 seconds
-	int32 clock_drift_;
-	// just used for logging
-	int32 clock_drift_raw_;
+	// -- 子组件 --
+	MtuDiscovery mtu_;
+	LedbatController cc_;
 
 	// -- 收发环形缓冲 (乱序重排 + 发送重传) --
 	// inbuf_: 接收侧乱序缓冲,按 16 位 seq_nr_ 索引;outbuf_: 发送侧包队列。
@@ -407,16 +338,6 @@ public:
 	// Public per-socket statistics, returned by utp_get_stats()
 	utp_socket_stats stats_;
 	#endif
-
-	// -- 拥塞控制状态 --
-	// slow_start_: 是否处于慢启动 (指数增长) 阶段;一旦排队延迟接近目标或窗口
-	// 超过 ssthresh_,则切换到 LEDBAT 拥塞避免阶段 (线性增长 / 减窗)。
-	// true if we're in slow-start (exponential growth) phase
-	bool slow_start_;
-
-	// ssthresh_: 慢启动阈值,首次超时或重复 ACK 检测到丢包时被更新。
-	// the slow-start threshold, in bytes
-	size_t ssthresh_;
 
 	void log(int level, char const *fmt, ...)
 	{
@@ -441,10 +362,6 @@ public:
 
 	void schedule_ack();
 
-	// called every time mtu_floor_ or mtu_ceiling_ are adjusted
-	void mtu_search_update();
-	void mtu_reset();
-
 	// Calculates the current receive window
 	size_t get_rcv_window()
 	{
@@ -458,24 +375,6 @@ public:
 	// XXX this breaks when spaced by > INT_MAX/2, which is 49
 	// days; the failure mode in that case is we do an extra decay
 	// or fail to do one when we really shouldn't.
-	bool can_decay_win(int64 msec) const
-	{
-                return (msec - last_rwin_decay_) >= MAX_WINDOW_DECAY;
-	}
-
-	// If we can, decay max window, returns true if we actually did so
-	void maybe_decay_win(uint64 current_ms)
-	{
-		if (can_decay_win(current_ms)) {
-			// TCP uses 0.5
-			max_window_ = (size_t)(max_window_ * .5);
-			last_rwin_decay_ = current_ms;
-			if (max_window_ < MIN_WINDOW_SIZE)
-				max_window_ = MIN_WINDOW_SIZE;
-			slow_start_ = false;
-			ssthresh_ = max_window_;
-		}
-	}
 
 	size_t get_header_size() const
 	{
@@ -525,7 +424,6 @@ public:
 	int ack_packet(uint16 seq);
 	size_t selective_ack_bytes(uint base, const byte* mask, byte len, int64& min_rtt);
 	void selective_ack(uint base, const byte *mask, byte len);
-	void apply_ccontrol(size_t bytes_acked, uint32 actual_delay, int64 min_rtt);
 	size_t get_packet_size() const;
 };
 
@@ -741,7 +639,7 @@ void UtpSocket::send_packet(OutgoingPacket *pkt)
 	time_t cur_time = utp_call_get_milliseconds(this->ctx, this);
 
 	if (pkt->transmissions == 0 || pkt->need_resend) {
-		cur_window_ += pkt->payload;
+		cc_.add_in_flight(pkt->payload);
 	}
 
 	pkt->need_resend = false;
@@ -755,13 +653,13 @@ void UtpSocket::send_packet(OutgoingPacket *pkt)
 	bool use_as_mtu_probe = false;
 
 	// TODO: this is subject to nasty wrapping issues! Below as well
- 	if (mtu_discover_time_ < (uint64)cur_time) {
+ 	if (mtu_.should_rediscover((uint64)cur_time)) {
 		// it's time to reset our MTU assupmtions
 		// and trigger a new search
-		mtu_reset();
+		mtu_.reset((uint32)get_udp_mtu(), (uint64)cur_time);
 	}
 
-	// don't use packets that are larger then mtu_ceiling_
+	// don't use packets that are larger then mtu_.ceiling()
 	// as probes, since they were probably used as probes
 	// already and failed, now we need it to fragment
 	// just to get it through
@@ -769,23 +667,22 @@ void UtpSocket::send_packet(OutgoingPacket *pkt)
 	// which is a magic number representing no-probe
 	// that why we don't send a probe for a packet with
 	// sequence number 0
- 	if (mtu_floor_ < mtu_ceiling_
-		&& pkt->length > mtu_floor_
-		&& pkt->length <= mtu_ceiling_
-		&& mtu_probe_seq_ == 0
+ 	if (mtu_.floor() < mtu_.ceiling()
+		&& pkt->length > mtu_.floor()
+		&& pkt->length <= mtu_.ceiling()
+		&& !mtu_.probe_seq()
 		&& seq_nr_ != 1
 		&& pkt->transmissions == 0) {
 
 		// we've already incremented seq_nr_
 		// for this packet
- 		mtu_probe_seq_ = (seq_nr_ - 1) & ACK_NR_MASK;
- 		mtu_probe_size_ = pkt->length;
-		assert(pkt->length >= mtu_floor_);
-		assert(pkt->length <= mtu_ceiling_);
+ 		mtu_.set_probe((seq_nr_ - 1) & ACK_NR_MASK, (uint32)pkt->length);
+		assert(pkt->length >= mtu_.floor());
+		assert(pkt->length <= mtu_.ceiling());
  		use_as_mtu_probe = true;
 		log(UTP_LOG_MTU, "MTU [PROBE] floor:%d ceiling:%d current:%d"
-			, mtu_floor_, mtu_ceiling_, mtu_probe_size_);
- 	}
+			, mtu_.floor(), mtu_.ceiling(), mtu_.probe_size());
+  	}
 
 	pkt->transmissions++;
 	send_data((byte*)pkt->data.data(), pkt->length,
@@ -799,7 +696,7 @@ bool UtpSocket::is_full(int bytes)
 	size_t packet_size = get_packet_size();
 	if (bytes < 0) bytes = packet_size;
 	else if (bytes > (int)packet_size) bytes = (int)packet_size;
-	size_t max_send = min(min(max_window_, opt_sndbuf_), max_window_user_);
+	size_t max_send = min(min(cc_.max_window(), opt_sndbuf_), max_window_user_);
 
 	// subtract one to save space for the FIN packet
 	if (cur_window_packets_ >= OUTGOING_BUFFER_MAX_SIZE - 1) {
@@ -808,19 +705,19 @@ bool UtpSocket::is_full(int bytes)
 		log(UTP_LOG_DEBUG, "is_full:false cur_window_packets_:%d MAX:%d", cur_window_packets_, OUTGOING_BUFFER_MAX_SIZE - 1);
 		#endif
 
-		last_maxed_out_window_ = ctx->current_ms_;
+		cc_.mark_window_full(ctx->current_ms_);
 		return true;
 	}
 
 	#if UTP_DEBUG_LOGGING
 	log(UTP_LOG_DEBUG, "is_full:%s. cur_window_:%u pkt:%u max:%u cur_window_packets_:%u max_window_:%u"
-		, (cur_window_ + bytes > max_send) ? "true" : "false"
-		, cur_window_, bytes, max_send, cur_window_packets_
-		, max_window_);
+		, (cc_.cur_window() + bytes > max_send) ? "true" : "false"
+		, (uint)cc_.cur_window(), bytes, max_send, cur_window_packets_
+		, (uint)cc_.max_window());
 	#endif
 
-	if (cur_window_ + bytes > max_send) {
-		last_maxed_out_window_ = ctx->current_ms_;
+	if (cc_.cur_window() + bytes > max_send) {
+		cc_.mark_window_full(ctx->current_ms_);
 		return true;
 	}
 	return false;
@@ -859,9 +756,8 @@ void UtpSocket::write_outgoing_packet(size_t payload, uint flags, struct utp_iov
 {
 	// Setup initial timeout timer
 	if (cur_window_packets_ == 0) {
-		retransmit_timeout_ = rto;
-		rto_timeout_ = ctx->current_ms_ + retransmit_timeout_;
-		assert(cur_window_ == 0);
+		cc_.set_initial_rto(ctx->current_ms_);
+		assert(cc_.cur_window() == 0);
 	}
 
 	size_t packet_size = get_packet_size();
@@ -973,7 +869,7 @@ void UtpSocket::check_invariant()
 		if (pkt == 0 || pkt->transmissions == 0 || pkt->need_resend) continue;
 		outstanding_bytes += pkt->payload;
 	}
-	assert(outstanding_bytes == cur_window_);
+	assert(outstanding_bytes == cc_.cur_window());
 }
 #endif
 
@@ -982,7 +878,7 @@ void UtpSocket::check_invariant()
 // 主要职责:
 //   1. 若 RTO 到期: RTO 翻倍、判定所有在飞包为丢失、降窗、必要时销毁套接字
 //      (SYN_SENT 失败 2 次 / 已连接 4 次重传都算失败) 并立即重发最老包。
-//   2. 处理零窗口定时器 (zerowindow_time_): 15s 探测一次。
+//   2. 处理零窗口定时器 (cc_.zerowindow_time()): 15s 探测一次。
 //   3. 若窗口出现空余, 把 CONNECTED_FULL 回退到 CONNECTED 并回调 on_state_change。
 //   4. 距上次发包超过 29s, 发送 keep-alive ACK 以维持 NAT 映射。
 //   5. MTU 探测包自身超时时, 收紧 mtu_ceiling_ 但不计入丢包, 加速二分搜索。
@@ -998,7 +894,7 @@ void UtpSocket::check_timeouts()
 	#if UTP_DEBUG_LOGGING
 	log(UTP_LOG_DEBUG, "CheckTimeouts timeout:%d max_window_:%u cur_window_:%u "
 			 "state:%s cur_window_packets_:%u",
-			 (int)(rto_timeout_ - ctx->current_ms_), (uint)max_window_, (uint)cur_window_,
+			 (int)(cc_.rto_timeout() - ctx->current_ms_), (uint)cc_.max_window(), (uint)cc_.cur_window(),
 			 statenames[state_], cur_window_packets_);
 	#endif
 	//如果是DSTROY了，清理包
@@ -1012,31 +908,21 @@ void UtpSocket::check_timeouts()
 
 		// Reset max window...
 		// 如果出现zerowindow了，重新设置接收方的Window
-		if ((int)(ctx->current_ms_ - zerowindow_time_) >= 0 && max_window_user_ == 0) {
+		if ((int)(ctx->current_ms_ - cc_.zerowindow_time()) >= 0 && max_window_user_ == 0) {
 			max_window_user_ = PACKET_SIZE;
 		}
 
-		if ((int)(ctx->current_ms_ - rto_timeout_) >= 0
-			&& rto_timeout_ > 0) { //需要进行重传
+		if (cc_.is_rto_expired(ctx->current_ms_)) { //需要进行重传
 
-			bool ignore_loss = false;
-			// mtu的探测包丢失了
-			if (cur_window_packets_ == 1
-				&& ((seq_nr_ - 1) & ACK_NR_MASK) == mtu_probe_seq_
-				&& mtu_probe_seq_ != 0) {
-				// we only had  a single outstanding packet that timed out, and it was the probe
-				mtu_ceiling_ = mtu_probe_size_ - 1;
-				mtu_search_update();
+			bool ignore_loss = mtu_.handle_probe_timeout(
+				(seq_nr_ - 1) & ACK_NR_MASK, cur_window_packets_, ctx->current_ms_);
+			if (ignore_loss) {
 				// this packet was most likely dropped because the packet size being
 				// too big and not because congestion. To accelerate the binary search for
 				// the MTU, resend immediately and don't reset the window size
-				ignore_loss = true;
 				log(UTP_LOG_MTU, "MTU [PROBE-TIMEOUT] floor:%d ceiling:%d current:%d"
-					, mtu_floor_, mtu_ceiling_, mtu_last_);
+					, mtu_.floor(), mtu_.ceiling(), mtu_.last());
 			}
-			// we dropepd the probe, clear these fields to
-			// allow us to send a new one
-			mtu_probe_seq_ = mtu_probe_size_ = 0;
 			log(UTP_LOG_MTU, "MTU [TIMEOUT]");
 
 			/*
@@ -1048,9 +934,9 @@ void UtpSocket::check_timeouts()
 			*/
 			//如果是mtu探测包，就不进行RTO翻倍
 			// Increase RTO
-			const uint new_timeout = ignore_loss ? retransmit_timeout_ : retransmit_timeout_ * 2;
+			const uint new_timeout = ignore_loss ? cc_.retransmit_timeout() : cc_.retransmit_timeout() * 2;
 
-			// They initiated the connection but failed to respond before the rto. 
+			// They initiated the connection but failed to respond before the rto.
 			// A malicious client can also spoof the destination address of a ST_SYN bringing us to this state.
 			// Kill the connection and do not notify the upper layer
 			if (state_ == CS_SYN_RECV) { //链接建立失败了，因为在RTO时间内，我们还没收到DATA
@@ -1060,7 +946,7 @@ void UtpSocket::check_timeouts()
 			}
 			//我们建立的链接，但是已经重传了2次，或者进行了4次数据重传
 			// We initiated the connection but the other side failed to respond before the rto
-			if (retransmit_count_ >= 4 || (state_ == CS_SYN_SENT && retransmit_count_ >= 2)) {
+			if (cc_.retransmit_count() >= 4 || (state_ == CS_SYN_SENT && cc_.retransmit_count() >= 2)) {
 				// 4 consecutive transmissions have timed out. Kill it. If we
 				// haven't even connected yet, give up after only 2 consecutive
 				// failed transmissions.
@@ -1072,33 +958,15 @@ void UtpSocket::check_timeouts()
 				return;
 			}
 			//更新RTO的时间
-			retransmit_timeout_ = new_timeout;
-			rto_timeout_ = ctx->current_ms_ + new_timeout;
+			cc_.set_retransmit_timeout(new_timeout);
+			cc_.set_rto_timeout(ctx->current_ms_ + new_timeout);
 
 			if (!ignore_loss) {
 				// On Timeout
 				duplicate_ack_ = 0;
 
 				int packet_size = get_packet_size();
-
-				if ((cur_window_packets_ == 0) && ((int)max_window_ > packet_size)) {
-					// we don't have any packets in-flight, even though
-					// we could. This implies that the connection is just
-					// idling. No need to be aggressive about resetting the
-					// congestion window. Just let it decay by a 3:rd.
-					// don't set it any lower than the packet size though
-					// 没有数据发送，我们将减小发送窗口
-					max_window_ = max(max_window_ * 2 / 3, size_t(packet_size));
-				} else {
-					// our delay was so high that our congestion window
-					// was shrunk below one packet, preventing us from
-					// sending anything for one time-out period. Now, reset
-					// the congestion window to fit one packet, to start over
-					// again
-					// 重置窗口，进行慢启动
-					max_window_ = packet_size;
-					slow_start_ = true;
-				}
+				cc_.on_rto_timeout(ctx->current_ms_, (size_t)packet_size, cur_window_packets_);
 			}
 			// 我们可以认为所有的packet都已经丢失了
 			// every packet should be considered lost
@@ -1106,17 +974,16 @@ void UtpSocket::check_timeouts()
 				OutgoingPacket *pkt = (OutgoingPacket*)outbuf_.get(seq_nr_ - i - 1);
 				if (pkt == 0 || pkt->transmissions == 0 || pkt->need_resend) continue;
 				pkt->need_resend = true;
-				assert(cur_window_ >= pkt->payload);
-				cur_window_ -= pkt->payload;
+				cc_.remove_in_flight(pkt->payload);
 			}
 			//如果当前窗口不为0，将重传数量增加
 			if (cur_window_packets_ > 0) {
-				retransmit_count_++;
+				cc_.increment_retransmit_count();
 				// used in parse_log.py
 				log(UTP_LOG_NORMAL, "Packet timeout. Resend. seq_nr_:%u. timeout:%u "
 					"max_window_:%u cur_window_packets_:%d"
-					, seq_nr_ - cur_window_packets_, retransmit_timeout_
-					, (uint)max_window_, int(cur_window_packets_));
+					, seq_nr_ - cur_window_packets_, cc_.retransmit_timeout()
+					, (uint)cc_.max_window(), int(cur_window_packets_));
 
 				fast_timeout_ = true;
 				timeout_seq_nr_ = seq_nr_;
@@ -1137,7 +1004,7 @@ void UtpSocket::check_timeouts()
 			//我们从全满状态，恢复到常态
 			#if UTP_DEBUG_LOGGING
 			log(UTP_LOG_DEBUG, "Socket writable. max_window_:%u cur_window_:%u packet_size:%u",
-				(uint)max_window_, (uint)cur_window_, (uint)get_packet_size());
+				(uint)cc_.max_window(), (uint)cc_.cur_window(), (uint)get_packet_size());
 			#endif
 			utp_call_on_state_change(this->ctx, this, UTP_STATE_WRITABLE);
 		}
@@ -1157,43 +1024,6 @@ void UtpSocket::check_timeouts()
 	case CS_DESTROY:
 		break;
 	}
-}
-
-// this should be called every time we change mtu_floor_ or mtu_ceiling_
-void UtpSocket::mtu_search_update()
-{
-	assert(mtu_floor_ <= mtu_ceiling_);
-
-	// binary search
-	mtu_last_ = (mtu_floor_ + mtu_ceiling_) / 2;
-
-	// enable a new probe to be sent
-	mtu_probe_seq_ = mtu_probe_size_ = 0;
-
-	// if the floor and ceiling are close enough, consider the
-	// MTU binary search complete. We set the current value
-	// to floor since that's the only size we know can go through
-	// also set the ceiling to floor to terminate the searching
-	if (mtu_ceiling_ - mtu_floor_ <= 16) {
-		mtu_last_ = mtu_floor_;
-		log(UTP_LOG_MTU, "MTU [DONE] floor:%d ceiling:%d current:%d"
-			, mtu_floor_, mtu_ceiling_, mtu_last_);
-		mtu_ceiling_ = mtu_floor_;
-		assert(mtu_floor_ <= mtu_ceiling_);
-		// Do another search in 30 minutes
-		mtu_discover_time_ = utp_call_get_milliseconds(this->ctx, this) + 30 * 60 * 1000;
-	}
-}
-
-void UtpSocket::mtu_reset()
-{
-	mtu_ceiling_ = get_udp_mtu();
-	// Less would not pass TCP...
-	mtu_floor_ = 576;
-	log(UTP_LOG_MTU, "MTU [RESET] floor:%d ceiling:%d current:%d"
-		, mtu_floor_, mtu_ceiling_, mtu_last_);
-	assert(mtu_floor_ <= mtu_ceiling_);
-	mtu_discover_time_ = utp_call_get_milliseconds(this->ctx, this) + 30 * 60 * 1000;
 }
 
 // returns:
@@ -1247,40 +1077,26 @@ int UtpSocket::ack_packet(uint16 seq)
 	if (pkt->transmissions == 1) {
 		// Estimate the round trip time.
 		const uint32 ertt = (uint32)((utp_call_get_microseconds(this->ctx, this) - pkt->time_sent) / 1000);
-		if (rtt == 0) {
-			// First round trip time sample
-			rtt = ertt;
-			rtt_var = ertt / 2;
-			// sanity check. rtt should never be more than 6 seconds
-//			assert(rtt < 6000);
-		} else {
-			// Compute new round trip times
-			const int delta = (int)rtt - ertt;
-			rtt_var = rtt_var + (int)(abs(delta) - rtt_var) / 4;
-			rtt = rtt - rtt/8 + ertt/8;
-			// sanity check. rtt should never be more than 6 seconds
-//			assert(rtt < 6000);
-			rtt_hist_.add_sample(ertt, ctx->current_ms_);
-		}
-		rto = max<uint>(rtt + rtt_var * 4, 1000);
+		// update_rtt() internally also sets retransmit_timeout_/rto_timeout_
+		cc_.update_rtt(ertt, ctx->current_ms_);
 
 		#if UTP_DEBUG_LOGGING
 		log(UTP_LOG_DEBUG, "rtt:%u avg:%u var:%u rto:%u",
-			ertt, rtt, rtt_var, rto);
+			ertt, cc_.rtt_ms(), cc_.rtt_var(), cc_.rto_ms());
 		#endif
 
+	} else {
+		cc_.set_retransmit_timeout(cc_.rto_ms());
+		cc_.set_rto_timeout(ctx->current_ms_ + cc_.rto_ms());
 	}
-	retransmit_timeout_ = rto;
-	rto_timeout_ = ctx->current_ms_ + rto;
 	// if need_resend is set, this packet has already
 	// been considered timed-out, and is not included in
 	// the cur_window_ anymore
 	if (!pkt->need_resend) {
-		assert(cur_window_ >= pkt->payload);
-		cur_window_ -= pkt->payload;
+		cc_.remove_in_flight(pkt->payload);
 	}
 	delete pkt;
-	retransmit_count_ = 0;
+	cc_.set_retransmit_count(0);
 	return 0;
 }
 
@@ -1492,146 +1308,9 @@ void UtpSocket::selective_ack(uint base, const byte *mask, byte len)
 	}
 
 	if (back_off)
-		maybe_decay_win(ctx->current_ms_);
+		cc_.maybe_decay_win(ctx->current_ms_);
 
 	duplicate_ack_ = count;
-}
-
-// apply_ccontrol: LEDBAT 拥塞控制核心,每收到一个 ACK 都会调用一次。
-// 算法思路:
-//   - 用 our_delay = min(对端测得的本端到对端延迟, 当前 RTT) 作为"我方方向上
-//     引入的排队延迟"估计。
-//   - off_target = target_delay_ - our_delay 表示距离目标延迟还有多少余量;
-//     正值 (我们还有余量) -> 加窗, 负值 (我们引入的排队过多) -> 减窗。
-//   - scaled_gain = MAX_CWND_INCREASE_BYTES_PER_RTT * window_factor * delay_factor,
-//     把"每个 RTT 至多增加 X 字节"按 ACK 所占窗口比例和延迟比例缩放。
-//   - 慢启动阶段: 窗口每次按 packet_size 翻倍式增长, 超过 ssthresh_ 或排队
-//     延迟达到 target 的 90% 时, 切到 LEDBAT 线性 (减/增) 模式。
-//   - 防"作弊": 时钟漂移 < -200000 (即对端故意让时钟变慢) 时追加 penalty,
-//     抑制其获得过多带宽。
-//   - 若 1 秒以上未触达 CWIN 上限 (受应用层速率限制), 不再继续加窗, 防止
-//     窗口无限膨胀。
-void UtpSocket::apply_ccontrol(size_t bytes_acked, uint32 actual_delay, int64 min_rtt)
-{
-	// the delay can never be greater than the rtt. The min_rtt
-	// variable is the RTT in microseconds
-
-	assert(min_rtt >= 0);
-	int32 our_delay = min<uint32>(our_hist_.get_value(), uint32(min_rtt));
-	assert(our_delay != INT_MAX);
-	assert(our_delay >= 0);
-
-	utp_call_on_delay_sample(this->ctx, this, our_delay / 1000);
-
-	// This test the connection under heavy load from foreground
-	// traffic. Pretend that our delays are very high to force the
-	// connection to use sub-packet size window sizes
-	//our_delay *= 4;
-
-	// target is microseconds
-	int target = target_delay_;
-	if (target <= 0) target = 100000;
-
-	// this is here to compensate for very large clock drift that affects
-	// the congestion controller into giving certain endpoints an unfair
-	// share of the bandwidth. We have an estimate of the clock drift
-	// (clock_drift_). The unit of this is microseconds per 5 seconds.
-	// empirically, a reasonable cut-off appears to be about 200000
-	// (which is pretty high). The main purpose is to compensate for
-	// people trying to "cheat" uTP by making their clock run slower,
-	// and this definitely catches that without any risk of false positives
-	// if clock_drift_ < -200000 start applying a penalty delay proportional
-	// to how far beoynd -200000 the clock drift is
-	int32 penalty = 0;
-	if (clock_drift_ < -200000) {
-		penalty = (-clock_drift_ - 200000) / 7;
-		our_delay += penalty;
-	}
-
-	double off_target = target - our_delay;
-
-	// this is the same as:
-	//
-	//    (min(off_target, target) / target) * (bytes_acked / max_window_) * MAX_CWND_INCREASE_BYTES_PER_RTT
-	//
-	// so, it's scaling the max increase by the fraction of the window this ack represents, and the fraction
-	// of the target delay the current delay represents.
-	// The min() around off_target protects against crazy values of our_delay, which may happen when th
-	// timestamps wraps, or by just having a malicious peer sending garbage. This caps the increase
-	// of the window size to MAX_CWND_INCREASE_BYTES_PER_RTT per rtt.
-	// as for large negative numbers, this direction is already capped at the min packet size further down
-	// the min around the bytes_acked protects against the case where the window size was recently
-	// shrunk and the number of acked bytes exceeds that. This is considered no more than one full
-	// window, in order to keep the gain within sane boundries.
-
-	assert(bytes_acked > 0);
-	double window_factor = (double)min(bytes_acked, max_window_) / (double)max(max_window_, bytes_acked);
-
-	double delay_factor = off_target / target;
-	double scaled_gain = MAX_CWND_INCREASE_BYTES_PER_RTT * window_factor * delay_factor;
-
-	// since MAX_CWND_INCREASE_BYTES_PER_RTT is a cap on how much the window size (max_window_)
-	// may increase per RTT, we may not increase the window size more than that proportional
-	// to the number of bytes that were acked, so that once one window has been acked (one rtt)
-	// the increase limit is not exceeded
-	// the +1. is to allow for floating point imprecision
-	assert(scaled_gain <= 1. + MAX_CWND_INCREASE_BYTES_PER_RTT * (double)min(bytes_acked, max_window_) / (double)max(max_window_, bytes_acked));
-
-	if (scaled_gain > 0 && ctx->current_ms_ - last_maxed_out_window_ > 1000) {
-		// if it was more than 1 second since we tried to send a packet
-		// and stopped because we hit the max window, we're most likely rate
-		// limited (which prevents us from ever hitting the window size)
-		// if this is the case, we cannot let the max_window_ grow indefinitely
-		scaled_gain = 0;
-	}
-
-	size_t ledbat_cwnd = (max_window_ + scaled_gain < MIN_WINDOW_SIZE) ? MIN_WINDOW_SIZE : (size_t)(max_window_ + scaled_gain);
-
-	// 慢启动 vs 拥塞避免 分支:
-	//   - 慢启动: 每个 ACK 把窗口按 packet_size 比例往上推 (近似指数增长),
-	//     直到 ss_cwnd > ssthresh_ 或排队延迟达到 target_delay_ 的 90%。
-	//   - 拥塞避免: 改用 LEDBAT 公式 (线性/亚线性) 计算 ledbat_cwnd。
-	// 退出慢启动的同时会把当前 max_window_ 记为新的 ssthresh_, 与 TCP 类似。
-	if (slow_start_) {
-		size_t ss_cwnd = (size_t)(max_window_ + window_factor*get_packet_size());
-		if (ss_cwnd > ssthresh_) {
-			slow_start_ = false;
-		} else if (our_delay > target*0.9) {
-			// even if we're a little under the target delay, we conservatively
-			// discontinue the slow start phase
-			slow_start_ = false;
-			ssthresh_ = max_window_;
-		} else {
-			max_window_ = max(ss_cwnd, ledbat_cwnd);
-		}
-	} else {
-		max_window_ = ledbat_cwnd;
-	}
-
-
-	// make sure that the congestion window is below max
-	// make sure that we don't shrink our window too small
-	max_window_ = clamp<size_t>(max_window_, MIN_WINDOW_SIZE, opt_sndbuf_);
-
-	// used in parse_log.py
-	log(UTP_LOG_NORMAL, "actual_delay:%u our_delay:%d their_delay:%u off_target:%d max_window_:%u "
-			"delay_base:%u delay_sum:%d target_delay_:%d acked_bytes:%u cur_window_:%u "
-			"scaled_gain:%f rtt:%u rate:%u wnduser:%u rto:%u timeout:%d get_microseconds:" I64u " "
-			"cur_window_packets_:%u packet_size:%u their_delay_base:%u their_actual_delay:%u "
-			"average_delay_:%d clock_drift_:%d clock_drift_raw_:%d delay_penalty:%d current_delay_sum_:" I64u
-			"current_delay_samples_:%d average_delay_base_:%d last_maxed_out_window_:" I64u " opt_sndbuf_:%d "
-			"current_ms:" I64u "",
-			actual_delay, our_delay / 1000, their_hist_.get_value() / 1000,
-			int(off_target / 1000), uint(max_window_), uint32(our_hist_.delay_base),
-			int((our_delay + their_hist_.get_value()) / 1000), int(target / 1000), uint(bytes_acked),
-			(uint)(cur_window_ - bytes_acked), (float)(scaled_gain), rtt,
-			(uint)(max_window_ * 1000 / (rtt_hist_.delay_base?rtt_hist_.delay_base:50)),
-			(uint)max_window_user_, rto, (int)(rto_timeout_ - ctx->current_ms_),
-			utp_call_get_microseconds(this->ctx, this), cur_window_packets_, (uint)get_packet_size(),
-			their_hist_.delay_base, their_hist_.delay_base + their_hist_.get_value(),
-			average_delay_, clock_drift_, clock_drift_raw_, penalty / 1000,
-			current_delay_sum_, current_delay_samples_, average_delay_base_,
-			uint64(last_maxed_out_window_), int(opt_sndbuf_), uint64(ctx->current_ms_));
 }
 
 static void utp_register_recv_packet(UtpSocket *conn, size_t len)
@@ -1660,9 +1339,7 @@ static void utp_register_recv_packet(UtpSocket *conn, size_t len)
 // connection is allowed to send
 size_t UtpSocket::get_packet_size() const
 {
-	int header_size = sizeof(PacketFormatV1);
-	size_t mtu = mtu_last_ ? mtu_last_ : mtu_ceiling_;
-	return mtu - header_size;
+	return mtu_.effective_mtu(get_header_size());
 }
 
 // Process an incoming packet
@@ -1851,18 +1528,17 @@ size_t utp_process_incoming(UtpSocket *conn, const byte *packet, size_t len, boo
 			&& conn->cur_window_packets_ > 0
 			&& pk_flags == ST_STATE) {//STATE包，curr_window > 0 且都应答了
 			++conn->duplicate_ack_;
-			if (conn->duplicate_ack_ == DUPLICATE_ACKS_BEFORE_RESEND && conn->mtu_probe_seq_) {
+			if (conn->duplicate_ack_ == DUPLICATE_ACKS_BEFORE_RESEND && conn->mtu_.probe_seq()) {
 				// It's likely that the probe was rejected due to its size, but we haven't got an
 				// ICMP report back yet
-				if (pk_ack_nr_ == ((conn->mtu_probe_seq_ - 1) & ACK_NR_MASK)) {
-					conn->mtu_ceiling_ = conn->mtu_probe_size_ - 1;
-					conn->mtu_search_update();
+				if (pk_ack_nr_ == ((conn->mtu_.probe_seq() - 1) & ACK_NR_MASK)) {
+					conn->mtu_.handle_probe_loss(conn->ctx->current_ms_);
 					conn->log(UTP_LOG_MTU, "MTU [DUPACK] floor:%d ceiling:%d current:%d"
-						, conn->mtu_floor_, conn->mtu_ceiling_, conn->mtu_last_);
+						, conn->mtu_.floor(), conn->mtu_.ceiling(), conn->mtu_.last());
 				} else {
 					// A non-probe was blocked before our probe.
 					// Can't conclude much, send a new probe
-					conn->mtu_probe_seq_ = conn->mtu_probe_size_ = 0;
+					conn->mtu_.clear_probe();
 				}
 			}
 		} else {
@@ -1893,11 +1569,9 @@ size_t utp_process_incoming(UtpSocket *conn, const byte *packet, size_t len, boo
 		if (pkt == 0 || pkt->transmissions == 0) continue;
 		assert((int)(pkt->payload) >= 0);
 		acked_bytes += pkt->payload; //计算已经被acked的字节数
-		if (conn->mtu_probe_seq_ && seq == conn->mtu_probe_seq_) {
-			conn->mtu_floor_ = conn->mtu_probe_size_;
-			conn->mtu_search_update();
+		if (conn->mtu_.handle_probe_ack(seq, conn->ctx->current_ms_)) {
 			conn->log(UTP_LOG_MTU, "MTU [ACK] floor:%d ceiling:%d current:%d"
-				, conn->mtu_floor_, conn->mtu_ceiling_, conn->mtu_last_);
+				, conn->mtu_.floor(), conn->mtu_.ceiling(), conn->mtu_.last());
 		}
 		//计算最小的rtt
 		// in case our clock is not monotonic
@@ -1915,8 +1589,8 @@ size_t utp_process_incoming(UtpSocket *conn, const byte *packet, size_t len, boo
 
 	#if UTP_DEBUG_LOGGING
 	conn->log(UTP_LOG_DEBUG, "acks:%d acked_bytes:%u seq_nr_:%d cur_window_:%u cur_window_packets_:%u relative_seqnr:%u max_window_:%u min_rtt:%u rtt:%u",
-		acks, (uint)acked_bytes, conn->seq_nr_, (uint)conn->cur_window_, conn->cur_window_packets_,
-		seqnr, (uint)conn->max_window_, (uint)(min_rtt / 1000), conn->rtt);
+		acks, (uint)acked_bytes, conn->seq_nr_, (uint)conn->cc_.cur_window(), conn->cur_window_packets_,
+		seqnr, (uint)conn->cc_.max_window(), (uint)(min_rtt / 1000), conn->cc_.rtt_ms());
 	#endif
 
 	uint64 p = pf1->tv_usec;
@@ -1927,17 +1601,17 @@ size_t utp_process_incoming(UtpSocket *conn, const byte *packet, size_t len, boo
 	// record the delay to report back
 	const uint32 their_delay = (uint32)(p == 0 ? 0 : time - p); //计算到对方的延迟，time是收到包的时间，p是对方的发包时间
 	conn->reply_micro_ = their_delay;
-	uint32 prev_delay_base = conn->their_hist_.delay_base;
-	if (their_delay != 0) conn->their_hist_.add_sample(their_delay, conn->ctx->current_ms_);
+	uint32 prev_delay_base = conn->cc_.their_hist().delay_base;
+	if (their_delay != 0) conn->cc_.their_hist().add_sample(their_delay, conn->ctx->current_ms_);
 
 	// if their new delay base is less than their previous one
 	// we should shift our delay base in the other direction in order
 	// to take the clock skew into account
 	if (prev_delay_base != 0 &&
-		wrapping_compare_less(conn->their_hist_.delay_base, prev_delay_base, TIMESTAMP_MASK)) {
+		wrapping_compare_less(conn->cc_.their_hist().delay_base, prev_delay_base, TIMESTAMP_MASK)) {
 		// never adjust more than 10 milliseconds
-		if (prev_delay_base - conn->their_hist_.delay_base <= 10000) {
-			conn->our_hist_.shift(prev_delay_base - conn->their_hist_.delay_base);
+		if (prev_delay_base - conn->cc_.their_hist().delay_base <= 10000) {
+			conn->cc_.our_hist().shift(prev_delay_base - conn->cc_.their_hist().delay_base);
 		}
 	}
 	//如果对面没有设置reply_micro_
@@ -1948,90 +1622,8 @@ size_t utp_process_incoming(UtpSocket *conn, const byte *packet, size_t len, boo
 	// know what it is. We can't update out history unless
 	// we have a true measured sample
 	if (actual_delay != 0) {
-		conn->our_hist_.add_sample(actual_delay, conn->ctx->current_ms_);
-
-		// this is keeping an average of the delay samples
-		// we've recevied within the last 5 seconds. We sum
-		// all the samples and increase the count in order to
-		// calculate the average every 5 seconds. The samples
-		// are based off of the average_delay_base_ to deal with
-		// wrapping counters.
-		if (conn->average_delay_base_ == 0) conn->average_delay_base_ = actual_delay;
-		int64 average_delay_sample = 0;
-		// distance walking from lhs to rhs, downwards
-		const uint32 dist_down = conn->average_delay_base_ - actual_delay;
-		// distance walking from lhs to rhs, upwards
-		const uint32 dist_up = actual_delay - conn->average_delay_base_;
-
-		if (dist_down > dist_up) {
-//			assert(dist_up < INT_MAX / 4);
-			// average_delay_base_ < actual_delay, we should end up
-			// with a positive sample
-			average_delay_sample = dist_up;
-		} else {
-//			assert(-int64(dist_down) < INT_MAX / 4);
-			// average_delay_base_ >= actual_delay, we should end up
-			// with a negative sample
-			average_delay_sample = -int64(dist_down);
-		}
-		conn->current_delay_sum_ += average_delay_sample;
-		++conn->current_delay_samples_;
-
-		if (conn->ctx->current_ms_ > conn->average_sample_time_) {
-
-			int32 prev_average_delay_ = conn->average_delay_;
-
-			assert(conn->current_delay_sum_ / conn->current_delay_samples_ < INT_MAX);
-			assert(conn->current_delay_sum_ / conn->current_delay_samples_ > -INT_MAX);
-			// write the new average
-			conn->average_delay_ = (int32)(conn->current_delay_sum_ / conn->current_delay_samples_);
-			// each slot represents 5 seconds
-			conn->average_sample_time_ += 5000;
-
-			conn->current_delay_sum_ = 0;
-			conn->current_delay_samples_ = 0;
-
-			// this makes things very confusing when logging the average delay
-//#if !g_log_utp
-			// normalize the average samples
-			// since we're only interested in the slope
-			// of the curve formed by the average delay samples,
-			// we can cancel out the actual offset to make sure
-			// we won't have problems with wrapping.
-			int min_sample = min(prev_average_delay_, conn->average_delay_);
-			int max_sample = max(prev_average_delay_, conn->average_delay_);
-
-			// normalize around zero. Try to keep the min <= 0 and max >= 0
-			int adjust = 0;
-			if (min_sample > 0) {
-				// adjust all samples (and the baseline) down by min_sample
-				adjust = -min_sample;
-			} else if (max_sample < 0) {
-				// adjust all samples (and the baseline) up by -max_sample
-				adjust = -max_sample;
-			}
-			if (adjust) {
-				conn->average_delay_base_ -= adjust;
-				conn->average_delay_ += adjust;
-				prev_average_delay_ += adjust;
-			}
-//#endif
-
-			// update the clock drift estimate
-			// the unit is microseconds per 5 seconds
-			// what we're doing is just calculating the average of the
-			// difference between each slot. Since each slot is 5 seconds
-			// and the timestamps unit are microseconds, we'll end up with
-			// the average slope across our history. If there is a consistent
-			// trend, it will show up in this value
-
-			//int64 slope = 0;
-			int32 drift = conn->average_delay_ - prev_average_delay_;
-
-			// clock_drift_ is a rolling average
-			conn->clock_drift_ = (int64(conn->clock_drift_) * 7 + drift) / 8;
-			conn->clock_drift_raw_ = drift;
-		}
+		conn->cc_.our_hist().add_sample(actual_delay, conn->ctx->current_ms_);
+		conn->cc_.update_delay_average(actual_delay, conn->ctx->current_ms_);
 	}
 
 	// if our new delay base is less than our previous one
@@ -2045,10 +1637,10 @@ size_t utp_process_incoming(UtpSocket *conn, const byte *packet, size_t len, boo
 	// second shift back would cause us to shift our delay base
 	// which then get's into a death spiral of shifting delay bases
 /*	if (prev_delay_base != 0 &&
-		wrapping_compare_less(conn->our_hist_.delay_base, prev_delay_base)) {
+		wrapping_compare_less(conn->cc_.our_hist().delay_base, prev_delay_base)) {
 		// never adjust more than 10 milliseconds
-		if (prev_delay_base - conn->our_hist_.delay_base <= 10000) {
-			conn->their_hist_.Shift(prev_delay_base - conn->our_hist_.delay_base);
+		if (prev_delay_base - conn->cc_.our_hist().delay_base <= 10000) {
+			conn->cc_.their_hist().Shift(prev_delay_base - conn->cc_.our_hist().delay_base);
 		}
 	}
 */
@@ -2056,15 +1648,40 @@ size_t utp_process_incoming(UtpSocket *conn, const byte *packet, size_t len, boo
 	// if the delay estimate exceeds the RTT, adjust the base_delay to
 	// compensate
 	assert(min_rtt >= 0);
-	if (int64(conn->our_hist_.get_value()) > min_rtt) {
-		conn->our_hist_.shift((uint32)(conn->our_hist_.get_value() - min_rtt));
+	if (int64(conn->cc_.our_hist().get_value()) > min_rtt) {
+		conn->cc_.our_hist().shift((uint32)(conn->cc_.our_hist().get_value() - min_rtt));
 	}
 
 	// only apply the congestion controller on acks
 	// if we don't have a delay measurement, there's
 	// no point in invoking the congestion control
-	if (actual_delay != 0 && acked_bytes >= 1) //如果我们确认过的数据大于1，我们就进行流控
-		conn->apply_ccontrol(acked_bytes, actual_delay, min_rtt);
+	if (actual_delay != 0 && acked_bytes >= 1) { //如果我们确认过的数据大于1，我们就进行流控
+		int32 our_delay = conn->cc_.apply_ccontrol(
+			acked_bytes, actual_delay, min_rtt,
+			conn->ctx->current_ms_, conn->opt_sndbuf_, conn->target_delay_,
+			conn->get_packet_size());
+		utp_call_on_delay_sample(conn->ctx, conn, our_delay / 1000);
+
+		// used in parse_log.py
+		conn->log(UTP_LOG_NORMAL, "actual_delay:%u our_delay:%d their_delay:%u off_target:%d max_window_:%u "
+				"delay_base:%u delay_sum:%d target_delay_:%d acked_bytes:%u cur_window_:%u "
+				"scaled_gain:%f rtt:%u rate:%u wnduser:%u rto:%u timeout:%d get_microseconds:" I64u " "
+				"cur_window_packets_:%u packet_size:%u their_delay_base:%u their_actual_delay:%u "
+				"average_delay_:%d clock_drift_:%d clock_drift_raw_:%d delay_penalty:%d current_delay_sum_:" I64u
+				"current_delay_samples_:%d average_delay_base_:%d last_maxed_out_window_:" I64u " opt_sndbuf_:%d "
+				"current_ms:" I64u "",
+				actual_delay, our_delay / 1000, conn->cc_.their_hist().get_value() / 1000,
+				(int)(our_delay / 1000 - (int)(conn->target_delay_ / 1000)), (uint)conn->cc_.max_window(), (uint32)conn->cc_.our_hist().delay_base,
+				(int)((our_delay + (int)conn->cc_.their_hist().get_value()) / 1000), (int)(conn->target_delay_ / 1000), (uint)acked_bytes,
+				(uint)(conn->cc_.cur_window() - acked_bytes), 0.0f, conn->cc_.rtt_ms(),
+				(uint)(conn->cc_.max_window() * 1000 / (conn->cc_.rtt_hist().delay_base ? conn->cc_.rtt_hist().delay_base : 50)),
+				(uint)conn->max_window_user_, conn->cc_.rto_ms(), (int)(conn->cc_.rto_timeout() - conn->ctx->current_ms_),
+				utp_call_get_microseconds(conn->ctx, conn), conn->cur_window_packets_, (uint)conn->get_packet_size(),
+				conn->cc_.their_hist().delay_base, conn->cc_.their_hist().delay_base + conn->cc_.their_hist().get_value(),
+				conn->cc_.average_delay(), conn->cc_.clock_drift(), conn->cc_.clock_drift_raw(), 0,
+				conn->cc_.current_delay_sum(), conn->cc_.current_delay_samples(), conn->cc_.average_delay_base(),
+				conn->cc_.last_maxed_out_window(), (int)conn->opt_sndbuf_, uint64(conn->ctx->current_ms_));
+	}
 
 	// sanity check, the other end should never ack packets
 	// past the point we've sent
@@ -2075,7 +1692,7 @@ size_t utp_process_incoming(UtpSocket *conn, const byte *packet, size_t len, boo
 		// That will reset it to 1 after 15 seconds.
 		if (conn->max_window_user_ == 0) //对端窗口满了，我们需要停下15s
 			// Reset max_window_user_ to 1 every 15 seconds.
-			conn->zerowindow_time_ = conn->ctx->current_ms_ + 15000;
+			conn->cc_.set_zerowindow_time(conn->ctx->current_ms_ + 15000);
 
 		// Respond to connect message
 		// Switch to CONNECTED state.
@@ -2141,7 +1758,7 @@ size_t utp_process_incoming(UtpSocket *conn, const byte *packet, size_t len, boo
 
 		#ifdef _DEBUG
 		if (conn->cur_window_packets_ == 0)
-			assert(conn->cur_window_ == 0);
+			assert(conn->cc_.cur_window() == 0);
 		#endif
 
 		// packets in front of this may have been acked by a
@@ -2162,7 +1779,7 @@ size_t utp_process_incoming(UtpSocket *conn, const byte *packet, size_t len, boo
 
 		#ifdef _DEBUG
 		if (conn->cur_window_packets_ == 0)
-			assert(conn->cur_window_ == 0);
+			assert(conn->cc_.cur_window() == 0);
 		#endif
 
 		// this invariant should always be true
@@ -2181,7 +1798,7 @@ size_t utp_process_incoming(UtpSocket *conn, const byte *packet, size_t len, boo
 		if (conn->fast_timeout_) {
 
 			#if UTP_DEBUG_LOGGING
-			conn->log(UTP_LOG_DEBUG, "Fast timeout %u,%u,%u?", (uint)conn->cur_window_, conn->seq_nr_ - conn->timeout_seq_nr_, conn->timeout_seq_nr_);
+			conn->log(UTP_LOG_DEBUG, "Fast timeout %u,%u,%u?", (uint)conn->cc_.cur_window(), conn->seq_nr_ - conn->timeout_seq_nr_, conn->timeout_seq_nr_);
 			#endif
 
 			// if the fast_resend_seq_nr_ is not pointing to the oldest outstanding packet, it suggests that we've already
@@ -2220,7 +1837,7 @@ size_t utp_process_incoming(UtpSocket *conn, const byte *packet, size_t len, boo
 
 	#if UTP_DEBUG_LOGGING
 	conn->log(UTP_LOG_DEBUG, "acks:%d acked_bytes:%u seq_nr_:%u cur_window_:%u cur_window_packets_:%u ",
-		acks, (uint)acked_bytes, conn->seq_nr_, (uint)conn->cur_window_, conn->cur_window_packets_);
+		acks, (uint)acked_bytes, conn->seq_nr_, (uint)conn->cc_.cur_window(), conn->cur_window_packets_);
 	#endif
 
 	// In case the ack dropped the current window below
@@ -2229,7 +1846,7 @@ size_t utp_process_incoming(UtpSocket *conn, const byte *packet, size_t len, boo
 		conn->state_ = CS_CONNECTED;
 		#if UTP_DEBUG_LOGGING
 		conn->log(UTP_LOG_DEBUG, "Socket writable. max_window_:%u cur_window_:%u packet_size:%u",
-			(uint)conn->max_window_, (uint)conn->cur_window_, (uint)conn->get_packet_size());
+			(uint)conn->cc_.max_window(), (uint)conn->cc_.cur_window(), (uint)conn->get_packet_size());
 		#endif
 		utp_call_on_state_change(conn->ctx, conn, UTP_STATE_WRITABLE);
 	}
@@ -2284,7 +1901,7 @@ size_t utp_process_incoming(UtpSocket *conn, const byte *packet, size_t len, boo
 			//如果我们收到FIN包，并且ACK_NR和eof_pkt_相等
 			if (!conn->got_fin_reached_ && conn->got_fin && conn->eof_pkt_ == conn->ack_nr_) {
 				conn->got_fin_reached_ = true; //我们已经响应了FIN包
-				conn->rto_timeout_ = conn->ctx->current_ms_ + min<uint>(conn->rto * 3, 60); //更新RTO_timeout时间戳
+				conn->cc_.set_rto_timeout(conn->ctx->current_ms_ + min<uint>(conn->cc_.rto_ms() * 3, 60)); //更新RTO_timeout时间戳
 
 				#if UTP_DEBUG_LOGGING
 				conn->log(UTP_LOG_DEBUG, "Posting EOF");
@@ -2410,21 +2027,17 @@ inline byte UTP_Version(PacketFormatV1 const* pf)
 // 关键初值含义:
 //   - state_ = CS_UNINITIALIZED: 尚未调用 utp_initialize_socket, 不在哈希表中。
 //   - seq_nr_ = 1, ack_nr_ = 0: 留出 0 作为"非法/初始"占位, 与 libutp 习惯一致。
-//   - rtt = 0, rtt_var = 800, rto = 3000: 未拿到样本时使用 3s 兜底 RTO。
-//   - max_window_ = 0: 真实窗口会在 utp_initialize_socket 中根据 mtu 设置。
 //   - max_window_user_ = 255 * PACKET_SIZE: 假定的对端最大接收窗口 (255 个满包)。
-//   - slow_start_ = true, ssthresh_ = opt_sndbuf_: 新连接默认走慢启动。
 //   - inbuf_ / outbuf_ 初始化为 16 项的环形缓冲, 之后按需扩张。
+//   - cc_ (LedbatController) 与 mtu_ (MtuDiscovery) 在各自默认构造中
+//     完成 LEDBAT 字段的初始赋值。
 UtpSocket::UtpSocket(utp_context* _ctx)
 	: addr()
 	, ctx(_ctx)
 	, ida(-1)
-	, retransmit_count_(0)
 	, reorder_count_(0)
 	, duplicate_ack_(0)
 	, cur_window_packets_(0)
-	, cur_window_(0)
-	, max_window_(0)
 	, opt_sndbuf_(_ctx->opt_sndbuf_)
 	, opt_rcvbuf_(_ctx->opt_rcvbuf_)
 	, target_delay_(_ctx->target_delay_)
@@ -2437,7 +2050,6 @@ UtpSocket::UtpSocket(utp_context* _ctx)
 	, fast_timeout_(false)
 	, max_window_user_(255 * PACKET_SIZE)
 	, state_(CS_UNINITIALIZED)
-	, last_rwin_decay_(0)
 	, eof_pkt_(0)
 	, ack_nr_(0)
 	, seq_nr_(1)
@@ -2447,40 +2059,18 @@ UtpSocket::UtpSocket(utp_context* _ctx)
 	, last_got_packet_(0)
 	, last_sent_packet_(0)
 	, last_measured_delay_(0)
-	, last_maxed_out_window_(0)
 	, userdata_(NULL)
-	, rtt(0)
-	, rtt_var(800)
-	, rto(3000)
-	, retransmit_timeout_(0)
-	, rto_timeout_(0)
-	, zerowindow_time_(0)
 	, conn_seed_(0)
 	, conn_id_recv_(0)
 	, conn_id_send_(0)
 	, last_rcv_win_(0)
 	, extensions_()
-	, mtu_discover_time_(0)
-	, mtu_ceiling_(0)
-	, mtu_floor_(0)
-	, mtu_last_(0)
-	, mtu_probe_seq_(0)
-	, mtu_probe_size_(0)
-	, average_delay_(0)
-	, current_delay_sum_(0)
-	, current_delay_samples_(0)
-	, average_delay_base_(0)
-	, average_sample_time_(0)
-	, clock_drift_(0)
-	, clock_drift_raw_(0)
-	, slow_start_(true)
-	, ssthresh_(_ctx->opt_sndbuf_)
+	, mtu_(this)
+	, cc_()
 {
 	inbuf_.initialize(16);
 	outbuf_.initialize(16);
-	our_hist_.clear(0);
-	their_hist_.clear(0);
-	rtt_hist_.clear(0);
+	cc_.set_ssthresh(_ctx->opt_sndbuf_);
 	memset(extensions_, 0, sizeof(extensions_));
 	#ifdef _DEBUG
 	memset(&stats_, 0, sizeof(utp_socket_stats));
@@ -2510,10 +2100,99 @@ UtpSocket::~UtpSocket()
 	for (size_t i = 0; i < inbuf_.buf_size(); i++) {
 		delete (InboundPacket*)inbuf_.element(i);
 	}
-	for (size_t i = 0; i < outbuf_.buf_size(); i++) {
+ 	for (size_t i = 0; i < outbuf_.buf_size(); i++) {
 		delete (OutgoingPacket*)outbuf_.element(i);
 	}
 }
+
+// =============================================================================
+// MtuDiscovery 方法定义: 这些方法需要调用 owner_->log(),
+// 因此必须在 UtpSocket 完整定义之后才能编译。
+// =============================================================================
+
+void MtuDiscovery::reset(uint32 udp_mtu, uint64 current_ms)
+{
+	mtu_ceiling_ = udp_mtu;
+	// 小于 576 字节的包 TCP 都通不过, 因此作为下界
+	mtu_floor_ = 576;
+	owner_->log(UTP_LOG_MTU, "MTU [RESET] floor:%d ceiling:%d current:%d"
+		, mtu_floor_, mtu_ceiling_, mtu_last_);
+	assert(mtu_floor_ <= mtu_ceiling_);
+	// 30 分钟后再次启动搜索
+	mtu_discover_time_ = current_ms + 30 * 60 * 1000;
+}
+
+void MtuDiscovery::search_update(uint64 current_ms)
+{
+	assert(mtu_floor_ <= mtu_ceiling_);
+
+	// 二分搜索: 取中点作为当前生效的 MTU
+	mtu_last_ = (mtu_floor_ + mtu_ceiling_) / 2;
+
+	// 清空在途探测, 以便发送新探测
+	mtu_probe_seq_ = mtu_probe_size_ = 0;
+
+	// 如果 floor 和 ceiling 已经非常接近 (差值 <= 16),
+	// 视二分搜索完成。mtu_last_ 取 floor (这是已知能通的最小值),
+	// 并把 ceiling 也设到 floor 以终止搜索。30 分钟后再次启动。
+	if (mtu_ceiling_ - mtu_floor_ <= 16) {
+		mtu_last_ = mtu_floor_;
+		owner_->log(UTP_LOG_MTU, "MTU [DONE] floor:%d ceiling:%d current:%d"
+			, mtu_floor_, mtu_ceiling_, mtu_last_);
+		mtu_ceiling_ = mtu_floor_;
+		assert(mtu_floor_ <= mtu_ceiling_);
+		mtu_discover_time_ = current_ms + 30 * 60 * 1000;
+	}
+}
+
+bool MtuDiscovery::handle_probe_ack(uint32 seq, uint64 current_ms)
+{
+	if (is_probe(seq)) {
+		mtu_floor_ = mtu_probe_size_;
+		search_update(current_ms);
+		return true;
+	}
+	return false;
+}
+
+bool MtuDiscovery::handle_probe_timeout(uint32 outstanding_seq, uint32 cur_window_packets, uint64 current_ms)
+{
+	bool ignore_loss = false;
+	// 仅当在飞包仅一个、且该包就是探测时, 才把它视为探测包被丢 (而非拥塞)。
+	if (cur_window_packets == 1 && is_probe(outstanding_seq)) {
+		mtu_ceiling_ = mtu_probe_size_ - 1;
+		search_update(current_ms);
+		ignore_loss = true;
+	}
+	// 不论是否处理, 都清空探测, 以便发送新探测。
+	clear_probe();
+	return ignore_loss;
+}
+
+void MtuDiscovery::handle_probe_loss(uint64 current_ms)
+{
+	mtu_ceiling_ = mtu_probe_size_ - 1;
+	search_update(current_ms);
+	clear_probe();
+}
+
+void MtuDiscovery::handle_icmp_fragmentation(uint16 next_hop_mtu, uint64 current_ms)
+{
+	// 限定 next_hop_mtu 到合理范围 (576 <= mtu < 8KB), 然后取 min
+	mtu_ceiling_ = std::min<uint32>(next_hop_mtu, mtu_ceiling_);
+	search_update(current_ms);
+	// 特殊情况: ICMP 报告是真实网络的 hard signal, 我们直接把 mtu_last_ 设到 ceiling,
+	// 不再取 floor/ceiling 中点。先保守采用新 ceiling 测试, 若下次探测能通,
+	// search_update 内部会再向上推进。
+	mtu_last_ = mtu_ceiling_;
+}
+
+void MtuDiscovery::handle_icmp_unknown(uint64 current_ms)
+{
+	mtu_ceiling_ = (mtu_floor_ + mtu_ceiling_) / 2;
+	search_update(current_ms);
+}
+
 
 void utp_initialize_socket(	utp_socket *conn,
 							const struct sockaddr *addr,
@@ -2545,21 +2224,17 @@ void utp_initialize_socket(	utp_socket *conn,
 	conn->last_got_packet_		= conn->ctx->current_ms_;
 	conn->last_sent_packet_		= conn->ctx->current_ms_;
 	conn->last_measured_delay_	= conn->ctx->current_ms_ + 0x70000000;
-	conn->average_sample_time_	= conn->ctx->current_ms_ + 5000;
-	conn->last_rwin_decay_		= conn->ctx->current_ms_ - MAX_WINDOW_DECAY;
-
-	conn->our_hist_.clear(conn->ctx->current_ms_);
-	conn->their_hist_.clear(conn->ctx->current_ms_);
-	conn->rtt_hist_.clear(conn->ctx->current_ms_);
+	conn->cc_.init_timing(conn->ctx->current_ms_);
+	conn->cc_.init_delay_histories(conn->ctx->current_ms_);
 
 	// initialize MTU floor and ceiling
-	conn->mtu_reset();
-	conn->mtu_last_ = conn->mtu_ceiling_;
+	conn->mtu_.reset((uint32)conn->get_udp_mtu(), conn->ctx->current_ms_);
+	conn->mtu_.set_last_to_ceiling();
 
 	conn->ctx->sockets_[UtpSocketKey(conn->addr, conn->conn_id_recv_)] = conn;
 
 	// we need to fit one packet in the window when we start the connection
-	conn->max_window_ = conn->get_packet_size();
+	conn->cc_.set_max_window(conn->get_packet_size());
 
 	#if UTP_DEBUG_LOGGING
 	conn->log(UTP_LOG_DEBUG, "UTP socket initialized");
@@ -2706,8 +2381,8 @@ int utp_connect(utp_socket *conn, const struct sockaddr *to, socklen_t tolen)
 			CUR_DELAY_SIZE, DELAY_BASE_HISTORY);
 
 	// Setup initial timeout timer.
-	conn->retransmit_timeout_ = 3000;
-	conn->rto_timeout_ = conn->ctx->current_ms_ + conn->retransmit_timeout_;
+	conn->cc_.set_retransmit_timeout(3000);
+	conn->cc_.set_rto_timeout(conn->ctx->current_ms_ + conn->cc_.retransmit_timeout());
 	conn->last_rcv_win_ = conn->get_rcv_window();
 
 	// if you need compatibiltiy with 1.8.1, use this. it increases attackability though.
@@ -3046,25 +2721,18 @@ int utp_process_icmp_fragmentation(utp_context *ctx, const byte* buffer, size_t 
 
 	// Constrain the next_hop_mtu to sane values.  It might not be initialized or sent properly
 	if (next_hop_mtu >= 576 && next_hop_mtu < 0x2000) {
-		conn->mtu_ceiling_ = min<uint32>(next_hop_mtu, conn->mtu_ceiling_);
-		conn->mtu_search_update();
-		// this is something of a speecial case, where we don't set mtu_last_
-		// to the value in between the floor and the ceiling. We can update the
-		// floor, because there might be more network segments after the one
-		// that sent this ICMP with smaller MTUs. But we want to test this
-		// MTU size first. If the next probe gets through, mtu_floor_ is updated
-		conn->mtu_last_ = conn->mtu_ceiling_;
+		conn->mtu_.handle_icmp_fragmentation(next_hop_mtu, conn->ctx->current_ms_);
 	} else {
 		// Otherwise, binary search. At this point we don't actually know
 		// what size the packet that failed was, and apparently we can't
 		// trust the next hop mtu either. It seems reasonably conservative
 		// to just lower the ceiling. This should not happen on working networks
 		// anyway.
-		conn->mtu_ceiling_ = (conn->mtu_floor_ + conn->mtu_ceiling_) / 2;
-		conn->mtu_search_update();
+		conn->mtu_.handle_icmp_unknown(conn->ctx->current_ms_);
 	}
 
-	conn->log(UTP_LOG_MTU, "MTU [ICMP] floor:%d ceiling:%d current:%d", conn->mtu_floor_, conn->mtu_ceiling_, conn->mtu_last_);
+	conn->log(UTP_LOG_MTU, "MTU [ICMP] floor:%d ceiling:%d current:%d"
+		, conn->mtu_.floor(), conn->mtu_.ceiling(), conn->mtu_.last());
 	return 1;
 }
 
@@ -3170,8 +2838,8 @@ ssize_t utp_writev(utp_socket *conn, struct utp_iovec *iovec_input, size_t num_i
 		#if UTP_DEBUG_LOGGING
 		conn->log(UTP_LOG_DEBUG, "Sending packet. seq_nr_:%u ack_nr_:%u wnd:%u/%u/%u rcv_win:%u size:%u cur_window_packets_:%u",
 			conn->seq_nr_, conn->ack_nr_,
-			(uint)(conn->cur_window_ + num_to_send),
-			(uint)conn->max_window_, (uint)conn->max_window_user_,
+			(uint)(conn->cc_.cur_window() + num_to_send),
+			(uint)conn->cc_.max_window(), (uint)conn->max_window_user_,
 			(uint)conn->last_rcv_win_, num_to_send,
 			conn->cur_window_packets_);
 		#endif
@@ -3318,8 +2986,8 @@ int utp_get_delays(UtpSocket *conn, uint32 *ours, uint32 *theirs, uint32 *age)
 		return -1;
 	}
 
-	if (ours)   *ours   = conn->our_hist_.get_value();
-	if (theirs) *theirs = conn->their_hist_.get_value();
+	if (ours)   *ours   = conn->cc_.our_hist().get_value();
+	if (theirs) *theirs = conn->cc_.their_hist().get_value();
 	if (age)    *age    = (uint32)(conn->ctx->current_ms_ - conn->last_measured_delay_);
 	return 0;
 }
@@ -3353,7 +3021,7 @@ void utp_close(UtpSocket *conn)
 		break;
 
 	case CS_SYN_SENT: //刚刚发送了SYN包，那么立刻更新RTO，然后进入DESTROY状态
-		conn->rto_timeout_ = utp_call_get_milliseconds(conn->ctx, conn) + min<uint>(conn->rto * 2, 60);
+		conn->cc_.set_rto_timeout(utp_call_get_milliseconds(conn->ctx, conn) + min<uint>(conn->cc_.rto_ms() * 2, 60));
 		// fall through
 	case CS_SYN_RECV:
 		// fall through
@@ -3392,7 +3060,7 @@ void utp_shutdown(UtpSocket *conn, int how)
 			}
 			break;
 		case CS_SYN_SENT:
-			conn->rto_timeout_ = utp_call_get_milliseconds(conn->ctx, conn) + min<uint>(conn->rto * 2, 60);
+			conn->cc_.set_rto_timeout(utp_call_get_milliseconds(conn->ctx, conn) + min<uint>(conn->cc_.rto_ms() * 2, 60));
 		default:
 			break;
 		}
@@ -3453,7 +3121,7 @@ utp_socket_stats* utp_get_stats(utp_socket *socket)
 	#ifdef _DEBUG
 		assert(socket);
 		if (!socket) return NULL;
-		socket->stats_.mtu_guess = socket->mtu_last_ ? socket->mtu_last_ : socket->mtu_ceiling_;
+		socket->stats_.mtu_guess = socket->mtu_.raw_mtu();
 		return &socket->stats_;
 	#else
 		return NULL;
