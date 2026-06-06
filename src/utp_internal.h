@@ -27,12 +27,12 @@
 #include <string.h>
 #include <assert.h>
 #include <stdio.h>
+#include <vector>
+#include <unordered_map>
 
 #include "utp.h"
 #include "utp_callbacks.h"
 #include "utp_templates.h"
-#include "utp_hash.h"
-#include "utp_hash.h"
 #include "utp_packedsockaddr.h"
 
 /* These originally lived in utp_config.h */
@@ -93,22 +93,25 @@ struct UTPSocketKey {
 struct UTPSocketKeyData {
 	UTPSocketKey key;
 	UTPSocket *socket;
-	utp_link_t link;
 };
 
-#define UTP_SOCKET_BUCKETS 79
-#define UTP_SOCKET_INIT    15
+struct UTPSocketKeyHash {
+	size_t operator()(const UTPSocketKey& k) const {
+		return static_cast<size_t>(k.compute_hash());
+	}
+};
 
-struct UTPSocketHT : utpHashTable<UTPSocketKey, UTPSocketKeyData> {
-	UTPSocketHT() {
-		const int buckets = UTP_SOCKET_BUCKETS;
-		const int initial = UTP_SOCKET_INIT;
-		this->Create(buckets, initial);
-	}
-	~UTPSocketHT() {
-		UTP_FreeAll(this);
-		this->Free();
-	}
+class UTPSocketHT {
+	std::unordered_map<UTPSocketKey, UTPSocketKeyData, UTPSocketKeyHash> map_;
+public:
+	UTPSocketHT() = default;
+	~UTPSocketHT();
+	UTPSocketKeyData* Lookup(const UTPSocketKey& key);
+	UTPSocketKeyData* Add(const UTPSocketKey& key);
+	UTPSocketKeyData* Delete(const UTPSocketKey& key);
+	size_t GetCount() { return map_.size(); }
+	auto begin() { return map_.begin(); }
+	auto end() { return map_.end(); }
 };
 
 struct struct_utp_context {
@@ -118,8 +121,8 @@ struct struct_utp_context {
 	uint64 current_ms; //当前时钟的缓存
 	utp_context_stats context_stats;
 	UTPSocket *last_utp_socket;
-	Array<UTPSocket*> ack_sockets; //等待发送ack的sockets
-	Array<RST_Info> rst_info;
+	std::vector<UTPSocket*> ack_sockets; //等待发送ack的sockets
+	std::vector<RST_Info> rst_info;
 	UTPSocketHT *utp_sockets;
 	size_t target_delay;
 	size_t opt_sndbuf;
