@@ -46,6 +46,33 @@ using std::min;
 using std::max;
 using std::clamp;
 
+// =============================================================================
+// 模块说明: uTP (uTorrent Transport Protocol) 核心协议实现
+// -----------------------------------------------------------------------------
+// uTP 是 BEP-29 定义的一种基于 UDP 的可靠传输协议,提供类似 TCP 的有序字节流
+// 语义,同时通过 LEDBAT 拥塞控制算法尽量少占带宽,把延迟留给交互式应用。
+//
+// 主要功能模块:
+//   1. 连接管理: UTPSocket 状态机 (CS_IDLE / SYN_SENT / SYN_RECV / CONNECTED /
+//      CONNECTED_FULL / RESET / DESTROY),SYN/SYN-ACK/FIN 握手和关闭流程。
+//   2. 数据收发: 发送侧的 OutgoingPacket 队列、接收侧 InboundPacket 乱序重排
+//      缓冲、按序向上层交付 (utp_call_on_read)。
+//   3. 拥塞控制: LEDBAT 算法 (apply_ccontrol) 基于排队延迟调整 CWIN,
+//      慢启动 -> 拥塞避免 -> RTO 超时降窗的三段式逻辑。
+//   4. 超时与重传: RTT/RTTVAR 估算 (RFC 6298 风格),RTO 翻倍,基于 SACK 的
+//      快速重传,以及零窗口探测定时器。
+//   5. MTU 探测: 二分搜索 mtu_floor/mtu_ceiling,根据 ICMP need-frag 反馈收紧。
+//
+// 关键设计思路:
+//   - 单线程事件驱动: 所有数据收发、超时、ACK 调度都通过回调触发,
+//     整个库非线程安全,但通过外部加锁可在多线程环境使用。
+//   - LEDBAT 拥塞控制: 目标延迟 target_delay (默认 100ms),基于"我们测量到
+//     的对端延迟 - 我们到对端的延迟"来估算排队延迟,以比 TCP 更"礼貌"的方式
+//     让出带宽。
+//   - 接收端使用延迟 ACK 合并策略,避免大量纯 ACK 包。
+//   - 通过 ICMP need-frag 与主动 MTU 探测结合,在 576~1500 字节间搜索最优 MTU。
+// =============================================================================
+
 #define	TIMEOUT_CHECK_INTERVAL	500
 
 // number of bytes to increase max window size by, per RTT. This is
@@ -127,6 +154,16 @@ static const cstr flagnames[] = {
 	"ST_DATA","ST_FIN","ST_STATE","ST_RESET","ST_SYN"
 };
 
+// CONN_STATE: uTP 套接字状态机。
+// 转换关系 (主要路径):
+//   CS_UNINITIALIZED (初始) -> utp_initialize_socket -> CS_IDLE
+//   CS_IDLE -> utp_connect()  -> CS_SYN_SENT
+//   CS_IDLE <- 收到 SYN      -> CS_SYN_RECV
+//   CS_SYN_SENT 收到 SYN-ACK  -> CS_CONNECTED
+//   CS_SYN_RECV 收到首个 DATA  -> CS_CONNECTED
+//   CS_CONNECTED (拥塞窗口满) -> CS_CONNECTED_FULL (反之亦然)
+//   CS_CONNECTED* 调用 close  -> CS_DESTROY (释放资源)
+//   任何状态收到 RST 或严重错误 -> CS_RESET (回调错误后转为 CS_DESTROY)
 enum CONN_STATE {
 	CS_UNINITIALIZED = 0,
 	CS_IDLE,
@@ -142,6 +179,11 @@ static const cstr statenames[] = {
 	"UNINITIALIZED", "IDLE","SYN_SENT", "SYN_RECV", "CONNECTED","CONNECTED_FULL","DESTROY_DELAY","RESET","DESTROY"
 };
 
+// OutgoingPacket: 发送缓冲区中的一个 uTP 包单元。data 包含 uTP 头 + 负载,
+// length 为总长度,payload 为负载长度 (用于流量统计 / CWIN 增减)。
+// transmissions 记录发送次数 (首次发送或重传后递增),time_sent 记录最近一次
+// 发送的微秒时间戳,RTT 估算和超时重传都依赖它。need_resend 用于标记在
+// RTO 触发时已被认定"丢失"、等待下次 flush 时被重新发送。
 struct OutgoingPacket {
 	size_t length = 0;
 	size_t payload = 0;
@@ -151,23 +193,49 @@ struct OutgoingPacket {
 	std::vector<uint8_t> data;
 };
 
+// InboundPacket: 接收侧重排缓冲区中的一个乱序包,等待 ack_nr 推进后按序交付。
+// data 中只保存包体 (不含 uTP 头),size 为其字节数。
+// 这些包只在乱序到达时分配;按序到达的包会直接调用 on_read 而不入队。
 struct InboundPacket {
 	uint32_t size = 0;
 	std::vector<uint8_t> data;
 };
 
+// =============================================================================
+// UTPSocket: 一次 uTP 连接的全部运行时状态,包含协议字段、缓冲、计时器、拥塞
+// 控制参数等。结构体非常"扁平",以便单线程事件循环中快速访问。
+// 下面的成员按职责分组 (与字段在结构体中出现的顺序基本一致):
+//   - 标识/地址
+//   - ACK 列表 / 重传 / 乱序 计数
+//   - 发送窗口 / 接收缓冲上限 / 目标延迟
+//   - 连接状态 / FIN / 关闭相关布尔位
+//   - 对端通告窗口 / 状态机当前状态
+//   - 序列号 (ack_nr / seq_nr / eof_pkt / fast_resend_seq_nr)
+//   - 延迟采样 (reply_micro / last_* / clock_drift / average_delay)
+//   - RTT 估算 (rtt / rtt_var / rto / rto_timeout)
+//   - 拥塞控制 (slow_start / ssthresh / max_window)
+//   - 接收/发送环形缓冲区 (inbuf / outbuf)
+//   - MTU 探测 (mtu_*)
+//   - 用户数据指针 (userdata) / 调试统计 (_stats)
+// =============================================================================
 struct UTPSocket {
 	UTPSocket(utp_context* _ctx);
 	~UTPSocket();
 
+	// -- 标识/地址: 对端压缩地址 + 所属上下文 --
 	PackedSockAddr addr;
 	utp_context *ctx;
 
+	// ida: 套接字在 ctx->ack_sockets 列表中的下标,-1 表示不在列表中。
+	// 删除套接字时通过"与末尾元素交换"实现 O(1) 摘除,因此需要记录位置。
 	int ida; //for ack socket list
 
+	// -- 计数: 重传、乱序、重复 ACK --
 	uint16 retransmit_count;
 
+	// reorder_count: 接收侧等待重排 (尚未按序交付) 的包数,用于决定 ACK 是否带 EACK。
 	uint16 reorder_count;
+	// duplicate_ack: 收到的连续重复 ACK 计数,达到阈值时触发快速重传。
 	byte duplicate_ack;
 	// 当前需要重新被发送的数据包数量,最旧的数据包应为seq_nr - cur_window_packets
 	// the number of packets in the send queue. Packets that haven't
@@ -175,6 +243,7 @@ struct UTPSocket {
 	// the oldest un-acked packet in the send queue is seq_nr - cur_window_packets
 	uint16 cur_window_packets;
 
+	// -- 发送/接收窗口: 字节数级别 + 上限配置 --
 	// how much of the window is used, number of bytes in-flight
 	// packets that have not yet been sent do not count, packets
 	// that are marked as needing to be re-sent (due to a timeout)
@@ -187,10 +256,12 @@ struct UTPSocket {
 	// UTP_RCVBUF setting, in bytes
 	size_t opt_rcvbuf;
 
+	// -- LEDBAT 目标延迟 (微秒) --
 	// this is the target delay, in microseconds
 	// for this socket. defaults to 100000.
 	size_t target_delay;
 
+	// -- FIN / 关闭 状态位: 用于优雅关闭流程 --
 	// Is a FIN packet in the reassembly buffer?
 	bool got_fin:1;
 	// Have we reached the FIN?
@@ -209,12 +280,14 @@ struct UTPSocket {
 	// Timeout procedure
 	bool fast_timeout:1;
 
+	// -- 接收端"对方允许的窗口" / 当前状态机 / 上次降窗时间 --
 	// max receive window for other end, in bytes
 	size_t max_window_user;
 	CONN_STATE state;
 	// TickCount when we last decayed window (wraps)
 	int64 last_rwin_decay;
 
+	// -- 序列号空间: 16 位回绕 --
 	// the sequence number of the FIN packet. This field is only set
 	// when we have received a FIN, and the flag field has the FIN flag set.
 	// it is used to know when it is safe to destroy the socket, we must have
@@ -235,8 +308,12 @@ struct UTPSocket {
 	// or any later packet (with a higher sequence number).
 	uint16 fast_resend_seq_nr;
 
+	// -- 延迟采样与时间戳 --
+	// reply_micro: 最近一次收到包时测得的"对端到我们"单向延迟,会回填到下个
+	// 出向包的 reply_micro 字段,供对端计算反向延迟。
 	uint32 reply_micro;
 
+	// last_got_packet / last_sent_packet: 最近一次收/发包的时间,用于 keep-alive。
 	uint64 last_got_packet;
 	uint64 last_sent_packet;
 	uint64 last_measured_delay;
@@ -246,8 +323,10 @@ struct UTPSocket {
 	// from growing when we're not sending at capacity
 	mutable uint64 last_maxed_out_window;
 
+	// userdata: 用户通过 utp_set_userdata 关联的自定义数据,供回调使用。
 	void *userdata;
 
+	// -- RTT 估算 (单位: 毫秒) 与 RTO 计时器 --
 	// Round trip time
 	uint rtt;
 	// Round trip time variance
@@ -255,12 +334,14 @@ struct UTPSocket {
 	// Round trip timeout
 	uint rto;
 	utp::DelayHistory rtt_hist;
+	// retransmit_timeout: 当前 RTO 重传退避值,首次超时后翻倍。
 	uint retransmit_timeout;
 	// The RTO timer will timeout here.
 	uint64 rto_timeout;
 	// When the window size is set to zero, start this timer. It will send a new packet every 30secs.
 	uint64 zerowindow_time;
 
+	// -- 连接标识 --
 	uint32 conn_seed;
 	// Connection ID for packets I receive
 	uint32 conn_id_recv;
@@ -269,13 +350,17 @@ struct UTPSocket {
 	// Last rcv window we advertised, in bytes
 	size_t last_rcv_win;
 
+	// -- 双向延迟历史 (用于 LEDBAT 排队延迟估算) --
+	// our_hist: 对方测得的"我们到对方"的延迟;their_hist: 我们测得的"对方到我们"的延迟。
+	// 两者相减可估计"我们方向上的排队延迟",作为 LEDBAT 调窗的反馈信号。
 	utp::DelayHistory our_hist;
 	utp::DelayHistory their_hist;
 
 	// extension bytes from SYN packet
 	byte extensions[8];
 
-	// MTU Discovery
+	// -- MTU 探测 (Path MTU Discovery) --
+	// mtu_discover_time: 下一次重置 MTU 搜索的截止时间。
 	// time when we should restart the MTU discovery
 	uint64 mtu_discover_time;
 	// ceiling and floor of binary search. last is the mtu size
@@ -286,6 +371,7 @@ struct UTPSocket {
 	// that packet
 	uint32 mtu_probe_seq, mtu_probe_size;
 
+	// -- 长时窗延迟统计 (5 秒粒度), 用于检测时钟漂移 --
 	// this is the average delay samples, as compared to the initial
 	// sample. It's averaged over 5 seconds
 	int32 average_delay;
@@ -312,6 +398,8 @@ struct UTPSocket {
 	// just used for logging
 	int32 clock_drift_raw;
 
+	// -- 收发环形缓冲 (乱序重排 + 发送重传) --
+	// inbuf: 接收侧乱序缓冲,按 16 位 seq_nr 索引;outbuf: 发送侧包队列。
 	utp::RawSequenceBuffer inbuf, outbuf;
 
 	#ifdef _DEBUG
@@ -319,9 +407,13 @@ struct UTPSocket {
 	utp_socket_stats _stats;
 	#endif
 
+	// -- 拥塞控制状态 --
+	// slow_start: 是否处于慢启动 (指数增长) 阶段;一旦排队延迟接近目标或窗口
+	// 超过 ssthresh,则切换到 LEDBAT 拥塞避免阶段 (线性增长 / 减窗)。
 	// true if we're in slow-start (exponential growth) phase
 	bool slow_start;
 
+	// ssthresh: 慢启动阈值,首次超时或重复 ACK 检测到丢包时被更新。
 	// the slow-start threshold, in bytes
 	size_t ssthresh;
 
@@ -631,6 +723,12 @@ void UTPSocket::send_rst(utp_context *ctx,
 	send_to_addr(ctx, (const byte*)&pf1, len, addr);
 }
 
+// send_packet: 把 outbuf 中已就绪的一个 OutgoingPacket 通过 send_data 真正发出。
+// 关键逻辑:
+//   - 首次发送或被标记 need_resend 时,才把负载计入 cur_window (CWIN 配额)。
+//   - 把当前 ack_nr 写入包头, 同时记录 time_sent, 供 ack_packet 中做 RTT 估算。
+//   - 如果在 MTU 探测窗口内, 可顺便将该包作为探针 (DON'T FRAGMENT) 发出。
+//   - transmissions 计数递增, 用于 RTO 计算和日志统计。
 void UTPSocket::send_packet(OutgoingPacket *pkt)
 {
 	// only count against the quota the first time we
@@ -878,6 +976,15 @@ void UTPSocket::check_invariant()
 }
 #endif
 
+// check_timeouts: 由 utp_check_timeouts (context 级别, 每 500ms 一次) 调用,
+// 负责检查单个套接字上的超时、keep-alive、可写性事件, 是协议"心跳"的核心。
+// 主要职责:
+//   1. 若 RTO 到期: RTO 翻倍、判定所有在飞包为丢失、降窗、必要时销毁套接字
+//      (SYN_SENT 失败 2 次 / 已连接 4 次重传都算失败) 并立即重发最老包。
+//   2. 处理零窗口定时器 (zerowindow_time): 15s 探测一次。
+//   3. 若窗口出现空余, 把 CONNECTED_FULL 回退到 CONNECTED 并回调 on_state_change。
+//   4. 距上次发包超过 29s, 发送 keep-alive ACK 以维持 NAT 映射。
+//   5. MTU 探测包自身超时时, 收紧 mtu_ceiling 但不计入丢包, 加速二分搜索。
 void UTPSocket::check_timeouts()
 {
 	#ifdef _DEBUG
@@ -1092,6 +1199,17 @@ void UTPSocket::mtu_reset()
 // 0: the packet was acked.
 // 1: it means that the packet had already been acked
 // 2: the packet has not been sent yet
+// ack_packet: 处理一个被对端确认的发送包 (通过累积 ACK 或 SACK/EACK)。
+// 返回值:
+//   0 - 包被本次 ACK 确认
+//   1 - 包已被 ACK 过 (重复)
+//   2 - 包尚未发送, 不应被 ACK (异常情况, 调用方应停止后续 ACK 推进)
+// 关键作用:
+//   - 若 transmissions == 1, 用 (now - time_sent) 估算 RTT, 更新 rtt/rtt_var
+//     与 rto (RFC 6298 风格 EWMA)。
+//   - 将 cur_window 减去该包负载 (释放 CWIN 配额)。
+//   - 复位 RTO 计时器和 retransmit_count。
+//   - 释放 OutgoingPacket 对象。
 int UTPSocket::ack_packet(uint16 seq)
 {
 	OutgoingPacket *pkt = (OutgoingPacket*)outbuf.get(seq);
@@ -1378,6 +1496,20 @@ void UTPSocket::selective_ack(uint base, const byte *mask, byte len)
 	duplicate_ack = count;
 }
 
+// apply_ccontrol: LEDBAT 拥塞控制核心,每收到一个 ACK 都会调用一次。
+// 算法思路:
+//   - 用 our_delay = min(对端测得的本端到对端延迟, 当前 RTT) 作为"我方方向上
+//     引入的排队延迟"估计。
+//   - off_target = target_delay - our_delay 表示距离目标延迟还有多少余量;
+//     正值 (我们还有余量) -> 加窗, 负值 (我们引入的排队过多) -> 减窗。
+//   - scaled_gain = MAX_CWND_INCREASE_BYTES_PER_RTT * window_factor * delay_factor,
+//     把"每个 RTT 至多增加 X 字节"按 ACK 所占窗口比例和延迟比例缩放。
+//   - 慢启动阶段: 窗口每次按 packet_size 翻倍式增长, 超过 ssthresh 或排队
+//     延迟达到 target 的 90% 时, 切到 LEDBAT 线性 (减/增) 模式。
+//   - 防"作弊": 时钟漂移 < -200000 (即对端故意让时钟变慢) 时追加 penalty,
+//     抑制其获得过多带宽。
+//   - 若 1 秒以上未触达 CWIN 上限 (受应用层速率限制), 不再继续加窗, 防止
+//     窗口无限膨胀。
 void UTPSocket::apply_ccontrol(size_t bytes_acked, uint32 actual_delay, int64 min_rtt)
 {
 	// the delay can never be greater than the rtt. The min_rtt
@@ -1454,6 +1586,11 @@ void UTPSocket::apply_ccontrol(size_t bytes_acked, uint32 actual_delay, int64 mi
 
 	size_t ledbat_cwnd = (max_window + scaled_gain < MIN_WINDOW_SIZE) ? MIN_WINDOW_SIZE : (size_t)(max_window + scaled_gain);
 
+	// 慢启动 vs 拥塞避免 分支:
+	//   - 慢启动: 每个 ACK 把窗口按 packet_size 比例往上推 (近似指数增长),
+	//     直到 ss_cwnd > ssthresh 或排队延迟达到 target_delay 的 90%。
+	//   - 拥塞避免: 改用 LEDBAT 公式 (线性/亚线性) 计算 ledbat_cwnd。
+	// 退出慢启动的同时会把当前 max_window 记为新的 ssthresh, 与 TCP 类似。
 	if (slow_start) {
 		size_t ss_cwnd = (size_t)(max_window + window_factor*get_packet_size());
 		if (ss_cwnd > ssthresh) {
@@ -1530,6 +1667,20 @@ size_t UTPSocket::get_packet_size() const
 // Process an incoming packet
 // syn is true if this is the first packet received. It will cut off parsing
 // as soon as the header is done
+// utp_process_incoming: 一个 uTP 数据包的核心处理函数, 涵盖了协议栈大半逻辑。
+// 处理流程:
+//   1. 验证 ack_nr 是否在合法窗口内, 防止伪造/重放。
+//   2. 解析扩展头 (SACK/EACK、extension bits), 拿到 selective ack 位图。
+//   3. 计算本端接收延迟 (their_delay), 写入 reply_micro 用于下个回包。
+//   4. 计算本次 ACK 覆盖的字节数, 调用 ack_packet 释放对应 in-flight 包,
+//      收集 min_rtt 用于延迟基线校准。
+//   5. 处理 SACK/EACK: selective_ack 触发快速重传 (4 个重复 ACK)。
+//   6. 更新 max_window_user (对端通告窗口), 处理零窗口探测。
+//   7. 推进连接状态: SYN_SENT->CONNECTED、SYN_RECV->CONNECTED, FIN 处理。
+//   8. 若 seqnr == 0 (按序): 投递到上层 on_read, 并 flush 重排缓冲;
+//      否则放入 inbuf 等待按序交付 (并立刻发 SACK)。
+//   9. 调用 apply_ccontrol 完成 LEDBAT 调窗。
+// syn=true 时仅解析头即返回, 用于初始 SYN 路径。
 size_t utp_process_incoming(UTPSocket *conn, const byte *packet, size_t len, bool syn = false)
 {
 	//统计信息
