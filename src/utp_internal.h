@@ -68,12 +68,6 @@ struct PACKED_ATTRIBUTE RstInfo {
 	uint64 timestamp;
 };
 
-// It's really important that we don't have duplicate keys in the hash table.
-// If we do, we'll eventually crash. if we try to remove the second instance
-// of the key, we'll accidentally remove the first instead. then later,
-// checkTimeouts will try to access the second one's already freed memory.
-void free_all(class UtpSocketTable *utp_sockets);
-
 // UtpSocketKey: 套接字哈希表的复合键,由"对端地址 + 我方接收连接 ID"组成。
 // 这里 recv_id 是对方在 SYN 包中告知我们的 connid (即我方作为接收方使用的 ID),
 // 它在建立连接时随机生成,用来在同一 (ip, port) 对端存在多个并发连接时唯一标识某条连接。
@@ -97,34 +91,16 @@ struct UtpSocketKey {
 	}
 };
 
-// UtpSocketKeyData: 哈希表中键对应的值,既保存键本身 (便于遍历),
-// 也保存指向实际 UtpSocket 对象的指针,实现 O(1) 的连接查找。
-struct UtpSocketKeyData {
-	UtpSocketKey key;
-	UtpSocket *socket;
-};
-
 struct UtpSocketKeyHash {
 	size_t operator()(const UtpSocketKey& k) const {
 		return static_cast<size_t>(k.compute_hash());
 	}
 };
 
-// UtpSocketTable: 包裹 std::unordered_map 的 uTP 套接字哈希表,负责管理所有活跃连接。
-// 之所以使用单独的薄包装类,是为了在析构时统一释放所有 UtpSocket,
-// 避免直接遍历 map_ 时遇到迭代器失效等问题。
-class UtpSocketTable {
-	std::unordered_map<UtpSocketKey, UtpSocketKeyData, UtpSocketKeyHash> map_;
-public:
-	UtpSocketTable() = default;
-	~UtpSocketTable();
-	UtpSocketKeyData* Lookup(const UtpSocketKey& key);
-	UtpSocketKeyData* Add(const UtpSocketKey& key);
-	UtpSocketKeyData* Delete(const UtpSocketKey& key);
-	size_t GetCount() { return map_.size(); }
-	auto begin() { return map_.begin(); }
-	auto end() { return map_.end(); }
-};
+// SocketMap: 所有活跃 uTP 连接的哈希表。
+// 键为 UtpSocketKey (对端地址+接收连接ID),值为 UtpSocket 裸指针。
+// UtpContext 拥有所有 socket 的生命周期,负责析构时统一释放。
+using SocketMap = std::unordered_map<UtpSocketKey, UtpSocket*, UtpSocketKeyHash>;
 
 // UtpContext: uTP 协议库全局上下文,所有套接字共享一个 context 实例。
 // 整个库采用单线程事件驱动模型,context 持有回调表、活跃套接字表、待发 ACK 列表、
@@ -148,7 +124,7 @@ public:
 	std::vector<UtpSocket*> ack_sockets_; //等待发送ack的sockets
 	// rst_info_: 已发送 RST 的历史缓存,用于抑制对同一四元组重复回 RST。
 	std::vector<RstInfo> rst_info_;
-	UtpSocketTable *utp_sockets_;
+	SocketMap sockets_;
 	// target_delay_: LEDBAT 拥塞控制的目标排队延迟,默认 100ms (CCONTROL_TARGET)。
 	size_t target_delay_;
 	// opt_sndbuf_ / opt_rcvbuf_: 套接字发送/接收缓冲区的默认上限。

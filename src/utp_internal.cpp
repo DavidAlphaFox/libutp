@@ -2503,8 +2503,8 @@ UtpSocket::~UtpSocket()
 	}
 
 	// Remove object from the global hash table
-	UtpSocketKeyData* kd = ctx->utp_sockets_->Delete(UtpSocketKey(addr, conn_id_recv_));
-	assert(kd);
+	auto erased = ctx->sockets_.erase(UtpSocketKey(addr, conn_id_recv_));
+	assert(erased == 1);
 
 	// remove the socket from ack_sockets if it was there also
 	remove_socket_from_ack_list(this);
@@ -2515,46 +2515,6 @@ UtpSocket::~UtpSocket()
 	}
 	for (size_t i = 0; i < outbuf_.buf_size(); i++) {
 		delete (OutgoingPacket*)outbuf_.element(i);
-	}
-}
-
-UtpSocketTable::~UtpSocketTable() {
-	for (auto& [key, data] : map_) {
-		delete data.socket;
-	}
-}
-
-UtpSocketKeyData* UtpSocketTable::Lookup(const UtpSocketKey& key) {
-	auto it = map_.find(key);
-	if (it != map_.end()) {
-		return &it->second;
-	}
-	return nullptr;
-}
-
-UtpSocketKeyData* UtpSocketTable::Add(const UtpSocketKey& key) {
-	auto [it, inserted] = map_.try_emplace(key, UtpSocketKeyData{key, nullptr});
-	return &it->second;
-}
-
-UtpSocketKeyData* UtpSocketTable::Delete(const UtpSocketKey& key) {
-	auto it = map_.find(key);
-	if (it != map_.end()) {
-		auto* data = &it->second;
-		map_.erase(it);
-		return data;
-	}
-	return nullptr;
-}
-
-void free_all(struct UtpSocketTable *utp_sockets) {
-	std::vector<UtpSocket*> sockets;
-	sockets.reserve(utp_sockets->GetCount());
-	for (auto& [key, data] : *utp_sockets) {
-		sockets.push_back(data.socket);
-	}
-	for (auto* s : sockets) {
-		delete s;
 	}
 }
 
@@ -2573,7 +2533,7 @@ void utp_initialize_socket(	utp_socket *conn,
 			conn_seed_ = utp_call_get_random(conn->ctx, conn);
 			// we identify v1 and higher by setting the first two bytes to 0x0001
 			conn_seed_ &= 0xffff;
-		} while (conn->ctx->utp_sockets_->Lookup(UtpSocketKey(psaddr, conn_seed_)));
+		} while (conn->ctx->sockets_.count(UtpSocketKey(psaddr, conn_seed_)));
 
 		conn_id_recv_ += conn_seed_;
 		conn_id_send_ += conn_seed_;
@@ -2599,7 +2559,7 @@ void utp_initialize_socket(	utp_socket *conn,
 	conn->mtu_reset();
 	conn->mtu_last_ = conn->mtu_ceiling_;
 
-	conn->ctx->utp_sockets_->Add(UtpSocketKey(conn->addr, conn->conn_id_recv_))->socket = conn;
+	conn->ctx->sockets_[UtpSocketKey(conn->addr, conn->conn_id_recv_)] = conn;
 
 	// we need to fit one packet in the window when we start the connection
 	conn->max_window_ = conn->get_packet_size();
@@ -2854,12 +2814,15 @@ int utp_process_udp(utp_context *ctx, const byte *buffer, size_t len, const stru
 		// if it's our send id, and we did not initiate the connection, our recv id is id - 1
 		// we have to check every case
 		//在connection的列表中寻找我们自己
-		UtpSocketKeyData* keyData;
-		if ( (keyData = ctx->utp_sockets_->Lookup(UtpSocketKey(addr, id))) ||
-			((keyData = ctx->utp_sockets_->Lookup(UtpSocketKey(addr, id + 1))) && keyData->socket->conn_id_send_ == id) ||
-			((keyData = ctx->utp_sockets_->Lookup(UtpSocketKey(addr, id - 1))) && keyData->socket->conn_id_send_ == id))
-		{
-			UtpSocket* conn = keyData->socket;
+		UtpSocket* conn = nullptr;
+		if (auto it = ctx->sockets_.find(UtpSocketKey(addr, id)); it != ctx->sockets_.end()) {
+			conn = it->second;
+		} else if (auto it2 = ctx->sockets_.find(UtpSocketKey(addr, id + 1)); it2 != ctx->sockets_.end() && it2->second->conn_id_send_ == id) {
+			conn = it2->second;
+		} else if (auto it3 = ctx->sockets_.find(UtpSocketKey(addr, id - 1)); it3 != ctx->sockets_.end() && it3->second->conn_id_send_ == id) {
+			conn = it3->second;
+		}
+		if (conn) {
 
 			#if UTP_DEBUG_LOGGING
 			ctx->log(UTP_LOG_DEBUG, NULL, "recv RST for existing connection");
@@ -2887,9 +2850,9 @@ int utp_process_udp(utp_context *ctx, const byte *buffer, size_t len, const stru
 		if (ctx->last_utp_socket_ && ctx->last_utp_socket_->addr == addr && ctx->last_utp_socket_->conn_id_recv_ == id) {
 			conn = ctx->last_utp_socket_;
 		} else {
-			UtpSocketKeyData* keyData = ctx->utp_sockets_->Lookup(UtpSocketKey(addr, id));
-			if (keyData) {
-				conn = keyData->socket;
+			auto it = ctx->sockets_.find(UtpSocketKey(addr, id));
+			if (it != ctx->sockets_.end()) {
+				conn = it->second;
 				ctx->last_utp_socket_ = conn;
 			}
 		}
@@ -2955,8 +2918,7 @@ int utp_process_udp(utp_context *ctx, const byte *buffer, size_t len, const stru
 		ctx->log(UTP_LOG_DEBUG, NULL, "Incoming connection from %s", addrfmt(addr, addrbuf));
 		#endif
 
-		UtpSocketKeyData* keyData = ctx->utp_sockets_->Lookup(UtpSocketKey(addr, id + 1));
-		if (keyData) {
+		if (ctx->sockets_.count(UtpSocketKey(addr, id + 1))) {
 
 			#if UTP_DEBUG_LOGGING
 			ctx->log(UTP_LOG_DEBUG, NULL, "rejected incoming connection, connection already exists");
@@ -2965,10 +2927,10 @@ int utp_process_udp(utp_context *ctx, const byte *buffer, size_t len, const stru
 			return 1;
 		}
 
-		if (ctx->utp_sockets_->GetCount() > 3000) {
+		if (ctx->sockets_.size() > 3000) {
 
 			#if UTP_DEBUG_LOGGING
-			ctx->log(UTP_LOG_DEBUG, NULL, "rejected incoming connection, too many uTP sockets %d", ctx->utp_sockets_->GetCount());
+			ctx->log(UTP_LOG_DEBUG, NULL, "rejected incoming connection, too many uTP sockets %zu", ctx->sockets_.size());
 			#endif
 
 			return 1;
@@ -3052,13 +3014,16 @@ static UtpSocket* parse_icmp_payload(utp_context *ctx, const byte *buffer, size_
 		return NULL;
 	}
 
-	UtpSocketKeyData* keyData;
-
-	if ( (keyData = ctx->utp_sockets_->Lookup(UtpSocketKey(addr, id))) ||
-		((keyData = ctx->utp_sockets_->Lookup(UtpSocketKey(addr, id + 1))) && keyData->socket->conn_id_send_ == id) ||
-		((keyData = ctx->utp_sockets_->Lookup(UtpSocketKey(addr, id - 1))) && keyData->socket->conn_id_send_ == id))
-	{
-		return keyData->socket;
+	UtpSocket* conn = nullptr;
+	if (auto it = ctx->sockets_.find(UtpSocketKey(addr, id)); it != ctx->sockets_.end()) {
+		conn = it->second;
+	} else if (auto it2 = ctx->sockets_.find(UtpSocketKey(addr, id + 1)); it2 != ctx->sockets_.end() && it2->second->conn_id_send_ == id) {
+		conn = it2->second;
+	} else if (auto it3 = ctx->sockets_.find(UtpSocketKey(addr, id - 1)); it3 != ctx->sockets_.end() && it3->second->conn_id_send_ == id) {
+		conn = it3->second;
+	}
+	if (conn) {
+		return conn;
 	}
 
 	#if UTP_DEBUG_LOGGING
@@ -3306,9 +3271,9 @@ void utp_check_timeouts(utp_context *ctx)
 		ctx->rst_info_.shrink_to_fit();
 	}
 	std::vector<UtpSocket*> sockets;
-	sockets.reserve(ctx->utp_sockets_->GetCount());
-	for (auto& [key, data] : *ctx->utp_sockets_) {
-		sockets.push_back(data.socket);
+	sockets.reserve(ctx->sockets_.size());
+	for (auto& [key, socket] : ctx->sockets_) {
+		sockets.push_back(socket);
 	}
 	for (auto* conn : sockets) {
 		conn->check_timeouts();

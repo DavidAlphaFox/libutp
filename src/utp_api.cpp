@@ -79,7 +79,6 @@ UtpContext::UtpContext()
 	memset(&context_stats_, 0, sizeof(context_stats_));
 	memset(callbacks_, 0, sizeof(callbacks_));
 	target_delay_ = CCONTROL_TARGET;
-	utp_sockets_ = new UtpSocketTable;
 
 	// 设置默认回调函数
 	callbacks_[UTP_GET_UDP_MTU]      = &utp_default_get_udp_mtu;
@@ -99,7 +98,14 @@ UtpContext::UtpContext()
 
 // utp_context 析构函数，清理资源
 UtpContext::~UtpContext() {
-	delete this->utp_sockets_;
+	std::vector<UtpSocket*> socks;
+	socks.reserve(sockets_.size());
+	for (auto& [key, socket] : sockets_) {
+		socks.push_back(socket);
+	}
+	for (auto* s : socks) {
+		delete s;
+	}
 }
 
 // 初始化 uTP 上下文
