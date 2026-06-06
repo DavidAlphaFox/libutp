@@ -8,3 +8,4 @@ tags
 build/
 build-*/
 .sisyphus/
+build_test/
