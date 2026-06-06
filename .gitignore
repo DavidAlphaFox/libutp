@@ -5,3 +5,6 @@ ucat
 ucat-static
 tags
 *~
+build/
+build-*/
+.sisyphus/
