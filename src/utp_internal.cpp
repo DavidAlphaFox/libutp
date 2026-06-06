@@ -32,7 +32,6 @@
 #include <memory>
 
 #include "utp_types.h"
-#include "utp_packedsockaddr.h"
 #include "utp_internal.h"
 #include "utp/sequence_buffer.hpp"
 #include "utp/delay_history.hpp"
@@ -224,7 +223,7 @@ public:
 	~UtpSocket();
 
 	// -- 标识/地址: 对端压缩地址 + 所属上下文 --
-	PackedSockAddr addr;
+	utp::Address addr;
 	utp_context *ctx;
 
 	// ida: 套接字在 ctx->ack_sockets_ 列表中的下标,-1 表示不在列表中。
@@ -508,7 +507,7 @@ public:
 	void send_keep_alive();
 
 	static void send_rst(utp_context *ctx,
-						 const PackedSockAddr &addr, uint32 conn_id_send_,
+						 const utp::Address &addr, uint32 conn_id_send_,
 						 uint16 ack_nr_, uint16 seq_nr_);
 
 	void send_packet(OutgoingPacket *pkt);
@@ -563,7 +562,7 @@ static void utp_register_sent_packet(utp_context *ctx, size_t length)
 	}
 }
 
-void send_to_addr(utp_context *ctx, const byte *p, size_t len, const PackedSockAddr &addr, int flags = 0)
+void send_to_addr(utp_context *ctx, const byte *p, size_t len, const utp::Address &addr, int flags = 0)
 {
 	socklen_t tolen;
 	SOCKADDR_STORAGE to = addr.get_sockaddr_storage(&tolen);
@@ -704,7 +703,7 @@ void UtpSocket::send_keep_alive()
 }
 
 void UtpSocket::send_rst(utp_context *ctx,
-	const PackedSockAddr &addr, uint32 conn_id_send_, uint16 ack_nr_, uint16 seq_nr_)
+	const utp::Address &addr, uint32 conn_id_send_, uint16 ack_nr_, uint16 seq_nr_)
 {
 	PacketFormatV1 pf1;
 	zeromem(&pf1);
@@ -2526,7 +2525,7 @@ void utp_initialize_socket(	utp_socket *conn,
 							uint32 conn_id_recv_,
 							uint32 conn_id_send_)
 {
-	PackedSockAddr psaddr = PackedSockAddr((const SOCKADDR_STORAGE*)addr, addrlen);
+	utp::Address psaddr = utp::Address((const SOCKADDR_STORAGE*)addr, addrlen);
 
 	if (need_seed_gen) {
 		do {
@@ -2780,7 +2779,7 @@ int utp_process_udp(utp_context *ctx, const byte *buffer, size_t len, const stru
 	assert(to);
 	if (!to) return 0;
 
-	const PackedSockAddr addr((const SOCKADDR_STORAGE*)to, tolen);
+	const utp::Address addr((const SOCKADDR_STORAGE*)to, tolen);
 
 	if (len < sizeof(PacketFormatV1)) {
 		#if UTP_DEBUG_LOGGING
@@ -2990,7 +2989,7 @@ static UtpSocket* parse_icmp_payload(utp_context *ctx, const byte *buffer, size_
 	assert(to);
 	if (!to) return NULL;
 
-	const PackedSockAddr addr((const SOCKADDR_STORAGE*)to, tolen);
+	const utp::Address addr((const SOCKADDR_STORAGE*)to, tolen);
 
 	// ICMP packets are only required to quote the first 8 bytes of the layer4
 	// payload.  The UDP payload is 8 bytes, and the UTP header is another 20
@@ -3086,7 +3085,7 @@ int utp_process_icmp_error(utp_context *ctx, const byte *buffer, size_t len, con
 	if (!conn) return 0;
 
 	const int err = (conn->state_ == CS_SYN_SENT) ? UTP_ECONNREFUSED : UTP_ECONNRESET;
-	const PackedSockAddr addr((const SOCKADDR_STORAGE*)to, tolen);
+	const utp::Address addr((const SOCKADDR_STORAGE*)to, tolen);
 
 	switch(conn->state_) {
 		// Don't pass on errors for idle/closed connections

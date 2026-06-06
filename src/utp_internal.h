@@ -32,8 +32,8 @@
 
 #include "utp.h"
 #include "utp_callbacks.h"
+#include "utp/address.hpp"
 #include "utp/endian.hpp"
-#include "utp_packedsockaddr.h"
 
 /* These originally lived in utp_config.h */
 #define CCONTROL_TARGET (100 * 1000) // us
@@ -62,7 +62,7 @@ enum BandwidthType {
 // 当收到无法识别的非 SYN 数据包时,服务端会回复 RST 并把对端 (地址+connid+ack_nr) 缓存下来;
 // 之后若再次收到相同数据包,只要仍在缓存窗口内,就不再重复发送 RST,以避免被攻击者放大。
 struct PACKED_ATTRIBUTE RstInfo {
-	PackedSockAddr addr;
+	utp::Address addr;
 	uint32 connid;
 	uint16 ack_nr;
 	uint64 timestamp;
@@ -73,10 +73,10 @@ struct PACKED_ATTRIBUTE RstInfo {
 // 它在建立连接时随机生成,用来在同一 (ip, port) 对端存在多个并发连接时唯一标识某条连接。
 // 比较和哈希运算都同时考虑地址与 connid,确保不同连接即使端口相同也能被区分。
 struct UtpSocketKey {
-	PackedSockAddr addr;
+	utp::Address addr;
 	uint32 recv_id;		 // "conn_seed", "conn_id"
 
-	UtpSocketKey(const PackedSockAddr& _addr, uint32 _recv_id) {
+	UtpSocketKey(const utp::Address& _addr, uint32 _recv_id) {
 		memset(this, 0, sizeof(*this));
 		addr = _addr;
 		recv_id = _recv_id;

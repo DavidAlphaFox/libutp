@@ -15,16 +15,17 @@ libutp/
 │   └── utp_types.h       # 基础类型定义
 ├── src/                  # 源代码
 │   ├── utp/              # C++23 模块化头文件
+│   │   ├── address.hpp   # 打包的 Socket 地址 (utp::Address)
 │   │   ├── config.hpp    # 编译期常量
 │   │   ├── endian.hpp    # 大端字节序模板
 │   │   ├── platform.hpp  # 平台相关类型
 │   │   ├── wire_format.hpp    # 线路协议数据结构
 │   │   ├── sequence_buffer.hpp # 序列号环形缓冲区
-│   │   └── delay_history.hpp  # 延迟历史记录
+│   │   ├── delay_history.hpp  # 延迟历史记录
+│   │   └── address.cpp   # utp::Address 实现
 │   ├── utp_api.cpp       # 公共 C API 实现
 │   ├── utp_internal.cpp  # 核心协议实现（连接管理、拥塞控制、超时重传）
 │   ├── utp_callbacks.cpp # 回调函数
-│   ├── utp_packedsockaddr.cpp # 打包的 Socket 地址
 │   └── utp_utils.cpp     # 工具函数（时间、MTU）
 ├── examples/             # 示例程序
 │   └── ucat.c            # 简单的 uTP 客户端/服务端
