@@ -2408,6 +2408,15 @@ inline byte UTP_Version(PacketFormatV1 const* pf)
 	return (pf->type() < ST_NUM_STATES && pf->ext < 3 ? pf->version() : 0);
 }
 
+// UTPSocket 构造函数: 对每个新创建的套接字设定一组保守的初始值。
+// 关键初值含义:
+//   - state = CS_UNINITIALIZED: 尚未调用 utp_initialize_socket, 不在哈希表中。
+//   - seq_nr = 1, ack_nr = 0: 留出 0 作为"非法/初始"占位, 与 libutp 习惯一致。
+//   - rtt = 0, rtt_var = 800, rto = 3000: 未拿到样本时使用 3s 兜底 RTO。
+//   - max_window = 0: 真实窗口会在 utp_initialize_socket 中根据 mtu 设置。
+//   - max_window_user = 255 * PACKET_SIZE: 假定的对端最大接收窗口 (255 个满包)。
+//   - slow_start = true, ssthresh = opt_sndbuf: 新连接默认走慢启动。
+//   - inbuf / outbuf 初始化为 16 项的环形缓冲, 之后按需扩张。
 UTPSocket::UTPSocket(utp_context* _ctx)
 	: addr()
 	, ctx(_ctx)
@@ -2702,6 +2711,13 @@ int utp_getsockopt(UTPSocket* conn, int opt)
 }
 
 // Try to connect to a specified host.
+// utp_connect: 主动发起一次 uTP 连接 (TCP 的 connect 等价物)。
+// 流程:
+//   1. 校验状态必须为 CS_UNINITIALIZED, 否则直接销毁 (防止重复 connect)。
+//   2. 调用 utp_initialize_socket 生成随机 conn_seed 与 conn_id_*, 状态 -> CS_SYN_SENT。
+//   3. seq_nr 重新随机化 (避免被攻击者猜出初始 seq)。
+//   4. 构造一个 ST_SYN 包 (只含头, 无负载) 放入 outbuf, 设置初始 RTO (3s) 并发送。
+//   5. 超时由 check_timeouts 处理: SYN_SENT 连续 2 次重传即判定失败。
 int utp_connect(utp_socket *conn, const struct sockaddr *to, socklen_t tolen)
 {
 	assert(conn);
@@ -2782,6 +2798,16 @@ int utp_connect(utp_socket *conn, const struct sockaddr *to, socklen_t tolen)
 }
 
 // Returns 1 if the UDP payload was recognized as a UTP packet, or 0 if it was not
+// utp_process_udp: 上层从 UDP socket 收到数据后调用的入口, 负责分派数据包。
+// 返回 1 表示"识别为 uTP 协议", 0 表示"非 uTP 协议" (忽略)。
+// 分派逻辑:
+//   - 长度/版本校验失败直接返回。
+//   - ST_RESET: 查找匹配连接并设置 CS_RESET/CS_DESTROY, 触发 on_error 回调。
+//   - 非 SYN 包: 优先用 last_utp_socket 快路径查找, 否则走哈希表;
+//                命中后调用 utp_process_incoming。
+//   - SYN 包 (新建连接): 校验 ON_ACCEPT 回调、连接数限制、防火墙回调后,
+//                创建新 UTPSocket, 状态 CS_SYN_RECV, 回 SYN-ACK, 触发 on_accept。
+//   - 其它无法识别的包: 缓存到 rst_info, 按需回送 RST (抑制放大攻击)。
 int utp_process_udp(utp_context *ctx, const byte *buffer, size_t len, const struct sockaddr *to, socklen_t tolen)
 {
 	assert(ctx);
@@ -3248,6 +3274,14 @@ void utp_issue_deferred_acks(utp_context *ctx)
 }
 
 // Should be called every 500ms
+// utp_check_timeouts: 应用层必须按 TIMEOUT_CHECK_INTERVAL (500ms) 节拍调用,
+// 负责驱动整个 context 下的所有套接字的心跳与超时。
+// 流程:
+//   1. 节流: 距上次调用不足 500ms 直接返回。
+//   2. 清理过期的 rst_info 缓存 (超过 RST_INFO_TIMEOUT = 10s), 收缩 vector。
+//   3. 先把哈希表里的套接字指针快照到 vector, 再依次调用 check_timeouts:
+//      拷贝到 vector 是为了在 check_timeouts 内部 delete 套接字时不会使迭代器失效。
+//   4. 对状态为 CS_DESTROY 的套接字, 在遍历后统一 delete 释放资源。
 void utp_check_timeouts(utp_context *ctx)
 {
 	assert(ctx);
