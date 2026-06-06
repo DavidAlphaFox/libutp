@@ -2,7 +2,6 @@
 set(UTP_SOURCES
     utp_api.cpp
     utp_callbacks.cpp
-    utp_hash.cpp
     utp_internal.cpp
     utp_packedsockaddr.cpp
     utp_utils.cpp
@@ -14,7 +13,6 @@ set(UTP_HEADERS_PUBLIC
 
 set(UTP_HEADERS_INTERNAL
     utp_callbacks.h
-    utp_hash.h
     utp_internal.h
     utp_packedsockaddr.h
     utp_templates.h

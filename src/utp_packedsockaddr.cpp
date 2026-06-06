@@ -27,7 +27,6 @@
 #include <stdio.h>
 
 #include "utp_types.h"
-#include "utp_hash.h"
 #include "utp_packedsockaddr.h"
 
 #include "libutp_inet_ntop.h"
@@ -57,7 +56,21 @@ bool PackedSockAddr::operator!=(const PackedSockAddr& rhs) const
 }
 
 uint32 PackedSockAddr::compute_hash() const {
-	return utp_hash_mem(&_in, sizeof(_in)) ^ _port;
+	uint32 h = 0;
+	const uint8 *p = (const uint8 *)&_in;
+	size_t n = sizeof(_in);
+	while (n >= 4) {
+		h ^= *(const uint32 *)p;
+		p += sizeof(uint32);
+		h = (h << 13) | (h >> 19);
+		n -= 4;
+	}
+	while (n != 0) {
+		h ^= *p++;
+		h = (h << 8) | (h >> 24);
+		n--;
+	}
+	return h ^ _port;
 }
 
 void PackedSockAddr::set(const SOCKADDR_STORAGE* sa, socklen_t len)
