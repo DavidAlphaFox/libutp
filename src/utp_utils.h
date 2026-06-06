@@ -20,6 +20,9 @@
  * THE SOFTWARE.
  */
 
+// 工具函数声明
+// 提供默认的时间获取、MTU 查询、UDP 开销计算和随机数生成函数
+
 uint64 utp_default_get_udp_mtu(utp_callback_arguments *args);
 uint64 utp_default_get_udp_overhead(utp_callback_arguments *args);
 uint64 utp_default_get_random(utp_callback_arguments *args);

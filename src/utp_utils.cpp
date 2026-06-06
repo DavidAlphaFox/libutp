@@ -20,6 +20,10 @@
  * THE SOFTWARE.
  */
 
+// 工具函数实现
+// 提供跨平台时间函数（毫秒/微秒）、MTU 查询、UDP 开销计算和随机数生成
+// 时间函数支持 Windows、macOS 和 Linux/POSIX，提供单调时间保证
+
 #include <stdlib.h>
 #include <assert.h>
 #include "utp.h"
@@ -208,6 +212,7 @@ static inline uint64 UTP_GetMicroseconds()
 	return now;
 }
 
+// MTU 和协议头部常量
 #define ETHERNET_MTU 1500
 #define IPV4_HEADER_SIZE 20
 #define IPV6_HEADER_SIZE 40
@@ -215,9 +220,8 @@ static inline uint64 UTP_GetMicroseconds()
 #define GRE_HEADER_SIZE 24
 #define PPPOE_HEADER_SIZE 8
 #define MPPE_HEADER_SIZE 2
-// packets have been observed in the wild that were fragmented
-// with a payload of 1416 for the first fragment
-// There are reports of routers that have MTU sizes as small as 1392
+// 在实际网络中观察到分片载荷为 1416 的数据包
+// 有报告称路由器 MTU 可小至 1392
 #define FUDGE_HEADER_SIZE 36
 #define TEREDO_MTU 1280
 
@@ -229,26 +233,36 @@ static inline uint64 UTP_GetMicroseconds()
 #define UDP_IPV6_MTU (ETHERNET_MTU - IPV6_HEADER_SIZE - UDP_HEADER_SIZE - GRE_HEADER_SIZE - PPPOE_HEADER_SIZE - MPPE_HEADER_SIZE - FUDGE_HEADER_SIZE)
 #define UDP_TEREDO_MTU (TEREDO_MTU - IPV6_HEADER_SIZE - UDP_HEADER_SIZE)
 
+// 获取默认 UDP MTU
+// 由于不知道本地接口地址，保守假设所有 IPv6 连接都是 Teredo
 uint64 utp_default_get_udp_mtu(utp_callback_arguments *args) {
 	// Since we don't know the local address of the interface,
 	// be conservative and assume all IPv6 connections are Teredo.
 	return (args->address->sa_family == AF_INET6) ? UDP_TEREDO_MTU : UDP_IPV4_MTU; //默认的MTU
 }
 
+// 获取默认 UDP 协议开销
+// 由于不知道本地接口地址，保守假设所有 IPv6 连接都是 Teredo
 uint64 utp_default_get_udp_overhead(utp_callback_arguments *args) {
 	// Since we don't know the local address of the interface,
 	// be conservative and assume all IPv6 connections are Teredo.
 	return (args->address->sa_family == AF_INET6) ? UDP_TEREDO_OVERHEAD : UDP_IPV4_OVERHEAD;
 }
 
+// 获取默认随机数
+// 简单使用 rand()，生产环境建议使用更安全的随机源
 uint64 utp_default_get_random(utp_callback_arguments *args) {
 	return rand();
 }
 
+// 获取当前时间（毫秒）
+// 精度：毫秒级，单调递增
 uint64 utp_default_get_milliseconds(utp_callback_arguments *args) {
 	return UTP_GetMilliseconds();
 }
 
+// 获取当前时间（微秒）
+// 精度：微秒级，单调递增，用于高精度时间戳和延迟测量
 uint64 utp_default_get_microseconds(utp_callback_arguments *args) {
 	return UTP_GetMicroseconds();
 }
