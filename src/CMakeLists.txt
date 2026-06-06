@@ -2,6 +2,7 @@
 set(UTP_SOURCES
     utp_api.cpp
     utp_callbacks.cpp
+    utp_callbacks_defaults.cpp
     utp_internal.cpp
     utp/address.cpp
     utp_utils.cpp
@@ -14,6 +15,7 @@ set(UTP_HEADERS_PUBLIC
 set(UTP_HEADERS_INTERNAL
     utp/address.hpp
     utp_callbacks.h
+    utp_callbacks.hpp
     utp_internal.h
     utp_types.h
     utp_utils.h
@@ -76,5 +78,5 @@ utp_set_warnings(utp)
 
 # ── 编译器特定选项 ─────────────────────────────────
 if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
-    target_compile_options(utp PRIVATE -fno-exceptions -fno-rtti)
+    target_compile_options(utp PRIVATE -fno-exceptions)
 endif()

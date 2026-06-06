@@ -33,6 +33,7 @@
 
 #include "utp_types.h"
 #include "utp_internal.h"
+#include "utp_callbacks.h"
 #include "utp/sequence_buffer.hpp"
 #include "utp/delay_history.hpp"
 #include "utp/wire_format.hpp"
@@ -603,7 +604,7 @@ void UtpSocket::send_data(byte* b, size_t length, BandwidthType type, uint32 fla
 	++stats_.nxmit;
 	#endif
 
-	if (ctx->callbacks_[UTP_ON_OVERHEAD_STATISTICS]) {
+	if (true) {
 		size_t n;
 		if (type == payload_bandwidth) {
 			// if this packet carries payload, just
@@ -2093,10 +2094,7 @@ size_t utp_process_incoming(UtpSocket *conn, const byte *packet, size_t len, boo
 			// If the user has defined the ON_CONNECT callback, use that to
 			// notify the user that the socket is now connected.  If ON_CONNECT
 			// has not been defined, notify the user via ON_STATE_CHANGE.
-			if (conn->ctx->callbacks_[UTP_ON_CONNECT])
-				utp_call_on_connect(conn->ctx, conn);
-			else
-				utp_call_on_state_change(conn->ctx, conn, UTP_STATE_CONNECT);
+			utp_call_on_connect(conn->ctx, conn);
 
 		// We've sent a fin, and everything was ACKed (including the FIN).
 		// cur_window_packets_ == acks means that this packet acked all 
@@ -2911,7 +2909,7 @@ int utp_process_udp(utp_context *ctx, const byte *buffer, size_t len, const stru
 		return 1;
 	}
 
-	if (ctx->callbacks_[UTP_ON_ACCEPT]) {
+	if (true) {
 
 		#if UTP_DEBUG_LOGGING
 		ctx->log(UTP_LOG_DEBUG, NULL, "Incoming connection from %s", addrfmt(addr, addrbuf));

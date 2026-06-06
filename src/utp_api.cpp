@@ -27,7 +27,121 @@
 
 #include <stdio.h>
 #include "utp_internal.h"
-#include "utp_utils.h"
+
+// CFunctionCallbackAdapter: 将旧的 C 函数指针回调适配到 UtpCallbacks 虚接口。
+// 由 utp_set_callback() 内部使用，无需用户直接操作。
+class CFunctionCallbackAdapter : public UtpCallbacks {
+	utp_callback_t* handlers_[UTP_ARRAY_SIZE] = {};
+
+	static utp_callback_arguments make_args(int type, utp_socket* sock) {
+		utp_callback_arguments args{};
+		args.callback_type = type;
+		args.socket = sock;
+		return args;
+	}
+
+public:
+	void set_handler(int id, utp_callback_t* fn) { handlers_[id] = fn; }
+
+	// ── ACTION ──
+	void sendto(UtpSocket*, const uint8_t* data, size_t len,
+	            const sockaddr* address, socklen_t address_len, uint32_t flags) override {
+		if (!handlers_[UTP_SENDTO]) return;
+		auto args = make_args(UTP_SENDTO, nullptr);
+		args.buf = data; args.len = len;
+		args.address = address; args.address_len = address_len; args.flags = flags;
+		handlers_[UTP_SENDTO](&args);
+	}
+
+	// ── QUERY ──
+	uint64 get_milliseconds(UtpSocket* s) override {
+		if (!handlers_[UTP_GET_MILLISECONDS]) return UtpCallbacks::get_milliseconds(s);
+		auto args = make_args(UTP_GET_MILLISECONDS, s);
+		return handlers_[UTP_GET_MILLISECONDS](&args);
+	}
+	uint64 get_microseconds(UtpSocket* s) override {
+		if (!handlers_[UTP_GET_MICROSECONDS]) return UtpCallbacks::get_microseconds(s);
+		auto args = make_args(UTP_GET_MICROSECONDS, s);
+		return handlers_[UTP_GET_MICROSECONDS](&args);
+	}
+	uint16 get_udp_mtu(UtpSocket* s, const sockaddr* a, socklen_t l) override {
+		if (!handlers_[UTP_GET_UDP_MTU]) return UtpCallbacks::get_udp_mtu(s, a, l);
+		auto args = make_args(UTP_GET_UDP_MTU, s);
+		args.address = a; args.address_len = l;
+		return (uint16)handlers_[UTP_GET_UDP_MTU](&args);
+	}
+	uint16 get_udp_overhead(UtpSocket* s, const sockaddr* a, socklen_t l) override {
+		if (!handlers_[UTP_GET_UDP_OVERHEAD]) return UtpCallbacks::get_udp_overhead(s, a, l);
+		auto args = make_args(UTP_GET_UDP_OVERHEAD, s);
+		args.address = a; args.address_len = l;
+		return (uint16)handlers_[UTP_GET_UDP_OVERHEAD](&args);
+	}
+	uint32 get_random(UtpSocket* s) override {
+		if (!handlers_[UTP_GET_RANDOM]) return UtpCallbacks::get_random(s);
+		auto args = make_args(UTP_GET_RANDOM, s);
+		return (uint32)handlers_[UTP_GET_RANDOM](&args);
+	}
+	size_t get_read_buffer_size(UtpSocket* s) override {
+		if (!handlers_[UTP_GET_READ_BUFFER_SIZE]) return UtpCallbacks::get_read_buffer_size(s);
+		auto args = make_args(UTP_GET_READ_BUFFER_SIZE, s);
+		return (size_t)handlers_[UTP_GET_READ_BUFFER_SIZE](&args);
+	}
+
+	// ── EVENT ──
+	int on_firewall(const sockaddr* a, socklen_t l) override {
+		if (!handlers_[UTP_ON_FIREWALL]) return UtpCallbacks::on_firewall(a, l);
+		auto args = make_args(UTP_ON_FIREWALL, nullptr);
+		args.address = a; args.address_len = l;
+		return (int)handlers_[UTP_ON_FIREWALL](&args);
+	}
+	void on_accept(UtpSocket* s, const sockaddr* a, socklen_t l) override {
+		if (!handlers_[UTP_ON_ACCEPT]) return;
+		auto args = make_args(UTP_ON_ACCEPT, s);
+		args.address = a; args.address_len = l;
+		handlers_[UTP_ON_ACCEPT](&args);
+	}
+	void on_connect(UtpSocket* s) override {
+		if (!handlers_[UTP_ON_CONNECT]) return;
+		auto args = make_args(UTP_ON_CONNECT, s);
+		handlers_[UTP_ON_CONNECT](&args);
+	}
+	void on_error(UtpSocket* s, int error_code) override {
+		if (!handlers_[UTP_ON_ERROR]) return;
+		auto args = make_args(UTP_ON_ERROR, s);
+		args.error_code = error_code;
+		handlers_[UTP_ON_ERROR](&args);
+	}
+	void on_read(UtpSocket* s, const uint8_t* data, size_t len) override {
+		if (!handlers_[UTP_ON_READ]) return;
+		auto args = make_args(UTP_ON_READ, s);
+		args.buf = data; args.len = len;
+		handlers_[UTP_ON_READ](&args);
+	}
+	void on_state_change(UtpSocket* s, int state) override {
+		if (!handlers_[UTP_ON_STATE_CHANGE]) return;
+		auto args = make_args(UTP_ON_STATE_CHANGE, s);
+		args.state = state;
+		handlers_[UTP_ON_STATE_CHANGE](&args);
+	}
+	void on_delay_sample(UtpSocket* s, int sample_ms) override {
+		if (!handlers_[UTP_ON_DELAY_SAMPLE]) return;
+		auto args = make_args(UTP_ON_DELAY_SAMPLE, s);
+		args.sample_ms = sample_ms;
+		handlers_[UTP_ON_DELAY_SAMPLE](&args);
+	}
+	void on_overhead_statistics(UtpSocket* s, bool send, size_t len, int type) override {
+		if (!handlers_[UTP_ON_OVERHEAD_STATISTICS]) return;
+		auto args = make_args(UTP_ON_OVERHEAD_STATISTICS, s);
+		args.send = send ? 1 : 0; args.len = len; args.type = type;
+		handlers_[UTP_ON_OVERHEAD_STATISTICS](&args);
+	}
+	void log(UtpSocket* s, const char* message) override {
+		if (!handlers_[UTP_LOG]) return;
+		auto args = make_args(UTP_LOG, s);
+		args.buf = reinterpret_cast<const uint8_t*>(message);
+		handlers_[UTP_LOG](&args);
+	}
+};
 
 extern "C" {
 
@@ -70,6 +184,7 @@ const char *utp_state_names[] = {
 // utp_context 构造函数，初始化上下文
 UtpContext::UtpContext()
 	: userdata_(NULL)
+	, callbacks_(std::make_unique<UtpCallbacks>())
 	, current_ms_(0)
 	, last_utp_socket_(NULL)
 	, log_normal_(false)
@@ -77,21 +192,7 @@ UtpContext::UtpContext()
 	, log_debug_(false)
 {
 	memset(&context_stats_, 0, sizeof(context_stats_));
-	memset(callbacks_, 0, sizeof(callbacks_));
 	target_delay_ = CCONTROL_TARGET;
-
-	// 设置默认回调函数
-	callbacks_[UTP_GET_UDP_MTU]      = &utp_default_get_udp_mtu;
-	callbacks_[UTP_GET_UDP_OVERHEAD] = &utp_default_get_udp_overhead;
-	callbacks_[UTP_GET_MILLISECONDS] = &utp_default_get_milliseconds;
-	callbacks_[UTP_GET_MICROSECONDS] = &utp_default_get_microseconds;
-	callbacks_[UTP_GET_RANDOM]       = &utp_default_get_random;
-
-	// 1 MB 接收缓冲区（即最大带宽延迟积）
-	// 对于 RTT 为 200ms 的对端，无法以超过 5 MB/s 的速度接收
-	// 对于 RTT 为 10ms 的对端，无法以超过 100 MB/s 的速度接收
-	// 这假设是足够的，因为带宽通常与 RTT 成正比
-	// 在设置下载速率限制时，所有 socket 的接收缓冲区应设置得更低，比如 60 kiB 左右
 	opt_rcvbuf_ = opt_sndbuf_ = 1024 * 1024;
 	last_check_ = 0;
 }
@@ -128,12 +229,17 @@ void utp_destroy(utp_context *ctx) {
 }
 
 // 设置回调函数
-// 参数: ctx - 上下文指针
-//       callback_name - 回调类型（如 UTP_ON_FIREWALL）
-//       proc - 回调函数指针
 void utp_set_callback(utp_context *ctx, int callback_name, utp_callback_t *proc) {
 	assert(ctx);
-	if (ctx) ctx->callbacks_[callback_name] = proc;
+	if (!ctx) return;
+	// 首次调用时，将默认 UtpCallbacks 替换为 C 函数指针适配器
+	auto* adapter = dynamic_cast<CFunctionCallbackAdapter*>(ctx->callbacks_.get());
+	if (!adapter) {
+		auto new_adapter = std::make_unique<CFunctionCallbackAdapter>();
+		adapter = new_adapter.get();
+		ctx->callbacks_ = std::move(new_adapter);
+	}
+	adapter->set_handler(callback_name, proc);
 }
 
 // 设置用户自定义数据

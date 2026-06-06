@@ -29,9 +29,10 @@
 #include <stdio.h>
 #include <vector>
 #include <unordered_map>
+#include <memory>
 
 #include "utp.h"
-#include "utp_callbacks.h"
+#include "utp_callbacks.hpp"
 #include "utp/address.hpp"
 #include "utp/endian.hpp"
 
@@ -108,7 +109,7 @@ using SocketMap = std::unordered_map<UtpSocketKey, UtpSocket*, UtpSocketKeyHash>
 class UtpContext {
 public:
 	void *userdata_;
-	utp_callback_t* callbacks_[UTP_ARRAY_SIZE];
+	std::unique_ptr<UtpCallbacks> callbacks_;
 
 	// current_ms_: 当前毫秒时钟的缓存,避免每个操作都向系统查询时间;
 	// utp_check_timeouts 会统一刷新,其它路径若需要时间应先更新该值。
