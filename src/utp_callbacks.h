@@ -20,6 +20,10 @@
  * THE SOFTWARE.
  */
 
+// 回调函数声明
+// 使用 C 函数指针机制（非 std::function），为用户提供事件通知接口
+// 每个回调函数在特定事件发生时被内部调用
+
 #ifndef __UTP_CALLBACKS_H__
 #define __UTP_CALLBACKS_H__
 

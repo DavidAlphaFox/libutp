@@ -22,6 +22,10 @@
  * THE SOFTWARE.
  */
 
+// 打包的 socket 地址实现
+// 统一处理 IPv4 和 IPv6 地址，使用 V4MAPPED 格式
+// 提供地址转换、比较、哈希和格式化输出功能
+
 #include <string.h>
 #include <assert.h>
 #include <stdio.h>

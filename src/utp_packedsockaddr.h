@@ -20,24 +20,29 @@
  * THE SOFTWARE.
  */
 
+// 打包的 socket 地址结构
+// 统一存储 IPv4 和 IPv6 地址，使用 V4MAPPED 格式（RFC 4291）
+// IPv4 地址存储为 ::ffff:a.b.c.d 格式，位于 _in6d[3]
+// 端口以主机字节序存储
+
 #ifndef __UTP_PACKEDSOCKADDR_H__
 #define __UTP_PACKEDSOCKADDR_H__
 
 #include "utp_types.h"
 
 struct PACKED_ATTRIBUTE PackedSockAddr {
-	// The values are always stored here in network byte order
+	// 值总是以网络字节序存储
 	union {
-		byte _in6[16];		// IPv6
-		uint16 _in6w[8];	// IPv6, word based (for convenience)
-		uint32 _in6d[4];	// Dword access
-		in6_addr _in6addr;	// For convenience
+		byte _in6[16];		// IPv6 地址
+		uint16 _in6w[8];	// IPv6，字访问（方便）
+		uint32 _in6d[4];	// 双字访问
+		in6_addr _in6addr;	// 方便访问
 	} _in;
 
-	// Host byte order
+	// 主机字节序
 	uint16 _port;
 
-	#define _sin4 _in._in6d[3]	// IPv4 is stored where it goes if mapped
+	#define _sin4 _in._in6d[3]	// IPv4 存储在映射后的位置
 
 	#define _sin6 _in._in6
 	#define _sin6w _in._in6w
