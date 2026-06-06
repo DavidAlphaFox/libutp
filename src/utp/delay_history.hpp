@@ -22,6 +22,10 @@
 
 #pragma once
 
+// 延迟历史记录模块
+// 用于测量和跟踪网络延迟，实现 LEDBAT 拥塞控制算法
+// 通过维护延迟基线和当前延迟历史来计算排队延迟
+
 #include <cstdint>
 #include <cstddef>
 #include <climits>
@@ -29,49 +33,43 @@
 
 namespace utp {
 
-static constexpr size_t kCurDelaySize = 3;
-static constexpr size_t kDelayBaseHistory = 13;
-static constexpr uint32_t kTimestampMask = 0xFFFFFFFF;
+static constexpr size_t kCurDelaySize = 3;      // 当前延迟历史记录数量
+static constexpr size_t kDelayBaseHistory = 13; // 延迟基线历史记录数量 (覆盖约 2 分钟)
+static constexpr uint32_t kTimestampMask = 0xFFFFFFFF;  // 时间戳掩码 (32 位)
 
-// compare if lhs is less than rhs, taking wrapping
-// into account. if lhs is close to UINT_MAX and rhs
-// is close to 0, lhs is assumed to have wrapped and
-// considered smaller
+// 比较两个时间戳是否 lhs < rhs，考虑回绕情况
+// 如果 lhs 接近 UINT_MAX 且 rhs 接近 0，则认为 lhs 已回绕，lhs < rhs
 static inline bool wrapping_compare_less(std::uint32_t lhs, std::uint32_t rhs, std::uint32_t mask)
 {
-	const std::uint32_t dist_down = (lhs - rhs) & mask;
-	const std::uint32_t dist_up = (rhs - lhs) & mask;
+	const std::uint32_t dist_down = (lhs - rhs) & mask;  // 向下走需要的距离
+	const std::uint32_t dist_up = (rhs - lhs) & mask;    // 向上走需要的距离
 
-	// if the distance walking up is shorter, lhs
-	// is less than rhs. If the distance walking down
-	// is shorter, then rhs is less than lhs
+	// 如果向上走的距离更短，则 lhs < rhs
+	// 如果向下走的距离更短，则 rhs < lhs
 	return dist_up < dist_down;
 }
 
+// 延迟历史记录类
+// 用于跟踪网络延迟并计算排队延迟
 class DelayHistory {
 	static constexpr uint32_t kUintMax = UINT_MAX;
 
 public:
-	std::uint32_t delay_base;
+	std::uint32_t delay_base;  // 延迟基线 (历史最小延迟)
 
-	// this is the history of delay samples,
-	// normalized by using the delay_base. These
-	// values are always greater than 0 and measures
-	// the queuing delay in microseconds
+	// 当前延迟历史 (归一化后的延迟样本，以 delay_base 为基准)
+	// 值始终 > 0，测量排队延迟 (单位：微秒)
 	std::uint32_t cur_delay_hist[kCurDelaySize];
-	size_t cur_delay_idx;
+	size_t cur_delay_idx;  // 当前延迟历史索引
 
-	// this is the history of delay_base. It's
-	// a number that doesn't have an absolute meaning
-	// only relative. It doesn't make sense to initialize
-	// it to anything other than values relative to
-	// what's been seen in the real world.
+	// 延迟基线历史
+	// 延迟基线是一个相对值，没有绝对意义
+	// 只有相对于实际观测值才有意义
 	std::uint32_t delay_base_hist[kDelayBaseHistory];
-	size_t delay_base_idx;
-	// the time when we last stepped the delay_base_idx
-	std::uint64_t delay_base_time;
+	size_t delay_base_idx;  // 延迟基线历史索引
+	std::uint64_t delay_base_time;  // 最后更新 delay_base_idx 的时间
 
-	bool delay_base_initialized;
+	bool delay_base_initialized;  // 延迟基线是否已初始化
 
 	DelayHistory() : delay_base(0)
 		, cur_delay_idx(0)
@@ -87,6 +85,7 @@ public:
 		}
 	}
 
+	// 清空延迟历史
 	void clear(std::uint64_t current_ms)
 	{
 		delay_base_initialized = false;
@@ -102,67 +101,53 @@ public:
 		}
 	}
 
+	// 调整延迟基线以处理时钟漂移
+	// 将所有基线延迟增加偏移量
+	// 通过观察对端的 delay_base 变化来考虑时钟偏差
 	void shift(const std::uint32_t offset)
 	{
-		// the offset should never be "negative"
-		// assert(offset < 0x10000000);
-
-		// increase all of our base delays by this amount
-		// this is used to take clock skew into account
-		// by observing the other side's changes in its base_delay
 		for (size_t i = 0; i < kDelayBaseHistory; i++) {
 			delay_base_hist[i] += offset;
 		}
 		delay_base += offset;
 	}
 
+	// 添加延迟样本
+	// 样本处理考虑时钟漂移和序列号回绕
+	// 每分钟更新一次延迟基线，使用过去 2 分钟的最小值
 	void add_sample(const std::uint32_t sample, std::uint64_t current_ms)
 	{
-		// The two clocks (in the two peers) are assumed not to
-		// progress at the exact same rate. They are assumed to be
-		// drifting, which causes the delay samples to contain
-		// a systematic error, either they are under-
-		// estimated or over-estimated. This is why we update the
-		// delay_base every two minutes, to adjust for this.
+		// 双方时钟的速率不完全相同，存在时钟漂移
+		// 这会导致延迟样本包含系统误差（低估或高估）
+		// 因此每 2 分钟更新一次 delay_base 来调整
 
-		// This means the values will keep drifting and eventually wrap.
-		// We can cross the wrapping boundry in two directions, either
-		// going up, crossing the highest value, or going down, crossing 0.
+		// 这意味着值会不断漂移并最终回绕
+		// 可以在两个方向上跨越回绕边界：向上（超过最大值）或向下（低于 0）
 
-		// if the delay_base is close to the max value and sample actually
-		// wrapped on the other end we would see something like this:
-		// delay_base = 0xffffff00, sample = 0x00000400
-		// sample - delay_base = 0x500 which is the correct difference
+		// 如果 delay_base 接近最大值，且样本在对端回绕
+		// 例如：delay_base = 0xffffff00, sample = 0x00000400
+		// sample - delay_base = 0x500 (正确差值)
 
-		// if the delay_base is instead close to 0, and we got an even lower
-		// sample (that will eventually update the delay_base), we may see
-		// something like this:
-		// delay_base = 0x00000400, sample = 0xffffff00
+		// 如果 delay_base 接近 0，且收到更小的样本
+		// 例如：delay_base = 0x00000400, sample = 0xffffff00
 		// sample - delay_base = 0xfffffb00
-		// this needs to be interpreted as a negative number and the actual
-		// recorded delay should be 0.
+		// 这应解释为负数，实际记录的延迟应为 0
 
-		// It is important that all arithmetic that assume wrapping
-		// is done with unsigned intergers. Signed integers are not guaranteed
-		// to wrap the way unsigned integers do. At least GCC takes advantage
-		// of this relaxed rule and won't necessarily wrap signed ints.
+		// 重要：所有假设回绕的算术运算必须使用无符号整数
+		// 有符号整数不一定像无符号整数那样回绕
 
-		// remove the clock offset and propagation delay.
-		// delay base is min of the sample and the current
-		// delay base. This min-operation is subject to wrapping
-		// and care needs to be taken to correctly choose the
-		// true minimum.
+		// 移除时钟偏移和传播延迟
+		// delay_base 是样本和当前延迟基线的最小值
+		// 最小值运算考虑回绕，需要正确选择真正的最小值
 
-		// specifically the problem case is when delay_base is very small
-		// and sample is very large (because it wrapped past zero), sample
-		// needs to be considered the smaller
+		// 特殊情况：delay_base 很小，样本很大（因为回绕过 0）
+		// 此时样本应被视为更小的值
 
 		if (!delay_base_initialized) {
-			// delay_base being 0 suggests that we haven't initialized
-			// it or its history with any real measurements yet. Initialize
-			// everything with this sample.
+			// delay_base 为 0 表示尚未初始化
+			// 使用此样本初始化所有历史记录
 			for (size_t i = 0; i < kDelayBaseHistory; i++) {
-				// if we don't have a value, set it to the current sample
+				// 如果没有值，设置为当前样本
 				delay_base_hist[i] = sample;
 				continue;
 			}
@@ -171,36 +156,36 @@ public:
 		}
 
 		if (wrapping_compare_less(sample, delay_base_hist[delay_base_idx], kTimestampMask)) {
-			// sample is smaller than the current delay_base_hist entry
-			// update it
+			// 样本小于当前的 delay_base_hist 条目
+			// 更新它
 			delay_base_hist[delay_base_idx] = sample;
 		}
 
-		// is sample lower than delay_base? If so, update delay_base
+		// 样本是否小于 delay_base？如果是则更新 delay_base
 		if (wrapping_compare_less(sample, delay_base, kTimestampMask)) {
-			// sample is smaller than the current delay_base
-			// update it
+			// 样本小于当前的 delay_base
+			// 更新它
 			delay_base = sample;
 		}
 
-		// this operation may wrap, and is supposed to
+		// 此运算可能回绕，这是预期的
 		const std::uint32_t delay = sample - delay_base;
-		// sanity check. If this is triggered, something fishy is going on
-		// it means the measured sample was greater than 32 seconds!
+		// 健全性检查。如果触发，说明有问题
+		// 这意味着测量的样本超过 32 秒！
 		//assert(delay < 0x2000000);
 
 		cur_delay_hist[cur_delay_idx] = delay;
 		cur_delay_idx = (cur_delay_idx + 1) % kCurDelaySize;
 
-		// once every minute
+		// 每分钟一次
 		if (current_ms - delay_base_time > 60 * 1000) {
 			delay_base_time = current_ms;
 			delay_base_idx = (delay_base_idx + 1) % kDelayBaseHistory;
-			// clear up the new delay base history spot by initializing
-			// it to the current sample, then update it
+			// 通过将新的延迟基线历史位置初始化为当前样本来清理
+			// 然后更新它
 			delay_base_hist[delay_base_idx] = sample;
 			delay_base = delay_base_hist[0];
-			// Assign the lowest delay in the last 2 minutes to delay_base
+			// 将过去 2 分钟内的最小延迟分配给 delay_base
 			for (size_t i = 0; i < kDelayBaseHistory; i++) {
 				if (wrapping_compare_less(delay_base_hist[i], delay_base, kTimestampMask))
 					delay_base = delay_base_hist[i];
@@ -208,15 +193,16 @@ public:
 		}
 	}
 
+	// 获取当前最小延迟值
 	std::uint32_t get_value() const
 	{
 		std::uint32_t value = kUintMax;
 		for (size_t i = 0; i < kCurDelaySize; i++) {
 			value = std::min(cur_delay_hist[i], value);
 		}
-		// value could be UINT_MAX if we have no samples yet...
+		// 如果还没有样本，value 可能是 UINT_MAX
 		return value;
 	}
 };
 
-} // namespace utp
+}  // namespace utp
