@@ -27,3 +27,10 @@ add_subdirectory(src)
 if(UTP_BUILD_EXAMPLES)
     add_subdirectory(examples)
 endif()
+
+# ── Testing ───────────────────────────────────────────────────
+option(BUILD_TESTING "Build tests" ON)
+if(BUILD_TESTING)
+    enable_testing()
+    add_subdirectory(tests)
+endif()
