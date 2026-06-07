@@ -20,6 +20,48 @@
  * THE SOFTWARE.
  */
 
+// =====================================================================================
+// 模块说明 (Module Description)
+// -------------------------------------------------------------------------------------
+// 本文件是 libutp（uTP / Micro Transport Protocol）协议库的核心数据包处理模块，
+// 负责将下层 UDP 套接字接收到的原始字节流解析为 uTP 协议数据，并完成：
+//
+//   1) 入口路由：utp_process_udp()
+//      应用层在 UDP 套接字上读到数据后调用此函数。它根据数据包首部的 type 字段
+//      （ST_DATA / ST_FIN / ST_STATE / ST_RESET / ST_SYN）把数据分发到不同处理路径，
+//      并管理 SYN 握手、RST 抑制、对未知连接回送 RST 等“控制平面”行为。
+//
+//   2) 入站处理：utp_process_incoming()
+//      单个已存在连接收到对端发来的数据包后被调用。它负责：
+//        - 解析 uTP 头部（版本号、类型、连接 ID、序列号、ACK 号、窗口、时间戳）；
+//        - 处理选择性 ACK（Selective ACK）扩展，从 ACK 中恢复被跳过的包；
+//        - 测量单向延迟并将样本送入 LEDBAT 拥塞控制算法；
+//        - 推进发送窗口（cur_window_packets_）、处理 FIN、处理重复 ACK / 快速重传；
+//        - 通过 inbuf_ 重排序缓冲区（reorder buffer）处理乱序到达的 ST_DATA 包，
+//          一旦序列号连续就交付给应用层 on_read 回调。
+//
+//   3) ICMP 处理：parse_icmp_payload() / utp_process_icmp_fragmentation() / utp_process_icmp_error()
+//      当下层 UDP 套接字收到 ICMP “目的不可达” / “需要分片” 报文时，
+//      内核会把触发该报文的原始 uTP 头部作为 payload 一并返回。这组函数负责
+//      从 ICMP payload 中识别出受影响的 uTP 连接并通知 MTU 发现模块或终止连接。
+//
+// 总体数据流（简化）：
+//
+//   udp_read() --> utp_process_udp()  --(SYN)-->  新建连接并回 SYN-ACK
+//                                |
+//                                +--(RST)-->   处理复位
+//                                |
+//                                +--(其他)--> utp_process_incoming()
+//                                                  |
+//                                                  +--> on_read() / schedule_ack()
+//                                                  +--> LEDBAT 拥塞控制更新
+//
+// 关键不变量：
+//   - 连接以 (peer_addr, recv_id) 为键哈希存储于 UtpContext::sockets_；
+//   - 发送窗口大小由 cur_window_packets_ 跟踪，拥塞窗口由 LedbatController 跟踪；
+//   - 所有延迟样本来自对端的 tv_usec / reply_micro 字段（绝对时间戳 - 回显时间戳）。
+// =====================================================================================
+
 #include <assert.h>
 #include <string.h>
 #include <vector>
@@ -50,11 +92,34 @@ void utp_initialize_socket(utp_socket *conn,
 
 utp_socket *utp_create_socket(utp_context *ctx);
 
+// =====================================================================================
+// 函数：utp_register_recv_packet
+// -------------------------------------------------------------------------------------
+// 作用：
+//   记录一次 uTP 数据包接收事件，并按数据包大小（bucket）累加上下文级统计计数器。
+//   该函数只做“记账”，不修改任何协议状态，调用开销极小，因此被 utp_process_incoming
+//   在解析头部之前无条件调用一次。
+//
+// 参数：
+//   conn - 接收数据包的连接（用于 _DEBUG 模式下的 per-socket 统计）
+//   len  - 接收到的原始 UDP 负载长度（包含 uTP 头 + 扩展 + 数据）
+//
+// 副作用：
+//   - 在 _DEBUG 模式下累加 conn->stats_.nrecv / nbytes_recv
+//   - 累加 ctx->context_stats_._nraw_recv[bucket] 计数器
+//
+// 桶（bucket）划分（见 config.hpp）：
+//   PACKET_SIZE_EMPTY   (23  B)  - 空包 / 仅控制头
+//   PACKET_SIZE_SMALL   (373 B)  - 小包
+//   PACKET_SIZE_MID     (723 B)  - 中包
+//   PACKET_SIZE_BIG     (1400 B)- 大包
+//   PACKET_SIZE_HUGE    (>1400) - 超大包
+// =====================================================================================
 static void utp_register_recv_packet(UtpSocket *conn, size_t len)
 {
 	#ifdef _DEBUG
-	++conn->stats_.nrecv;
-	conn->stats_.nbytes_recv += len;
+	++conn->stats_.nrecv;                  // DEBUG 模式下递增接收包计数
+	conn->stats_.nbytes_recv += len;        // DEBUG 模式下累加接收字节数
 	#endif
 
 	if (len <= PACKET_SIZE_MID) {
