@@ -36,14 +36,10 @@
 #include "utp/address.hpp"
 #include "utp/endian.hpp"
 
-/* These originally lived in utp_config.h */
-#define CCONTROL_TARGET (100 * 1000) // us
+extern char addrbuf[65];
+#define addrfmt(x, s) x.fmt(s, sizeof(s))
 
-enum BandwidthType {
-	payload_bandwidth, connect_overhead,
-	close_overhead, ack_overhead,
-	header_overhead, retransmit_overhead
-};
+class UtpSocket;
 
 #ifdef WIN32
 	#ifdef _MSC_VER

@@ -3,7 +3,8 @@ set(UTP_SOURCES
     utp_api.cpp
     utp_callbacks.cpp
     utp_callbacks_defaults.cpp
-    utp_internal.cpp
+    utp_process.cpp
+    utp_socket.cpp
     utp/address.cpp
     utp/ledbat.cpp
 )
@@ -17,7 +18,9 @@ set(UTP_HEADERS_INTERNAL
     utp_callbacks.h
     utp_callbacks.hpp
     utp/ledbat.hpp
+    utp/mtu_discovery.hpp
     utp_internal.h
+    utp_socket.hpp
     utp_types.h
 )
 

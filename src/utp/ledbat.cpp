@@ -21,6 +21,7 @@
  */
 
 #include "utp/ledbat.hpp"
+#include "utp/config.hpp"
 
 #include <algorithm>
 #include <cassert>
@@ -28,9 +29,9 @@
 #include <cmath>
 #include <cstdlib>
 
-// 慢启动窗口每 RTT 增量: 字节数。 与原 utp_internal.cpp 中保持一致;
-// 该常量仅 apply_ccontrol 内部使用, 故仅在 .cpp 中定义。
-#define MAX_CWND_INCREASE_BYTES_PER_RTT 3000
+// MAX_CWND_INCREASE_BYTES_PER_RTT 等常量从 utp::config 命名空间引入,
+// 与 src/utp_socket.cpp 等其他 .cpp 文件统一, 避免分散的 #define。
+using namespace utp::config;
 
 using std::min;
 using std::max;
