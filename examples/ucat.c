@@ -45,22 +45,29 @@
 
 #include "utp.h"
 
-// options
-int o_debug;
-char *o_local_address,  *o_local_port,
-	 *o_remote_address, *o_remote_port;
-int o_listen;
-int o_buf_size = 4096;
-int o_numeric;
+// 命令行选项与全局状态
+int o_debug;                                       // 调试模式开关（可累加：值越大越详细）
+char *o_local_address,  *o_local_port,             // 本地绑定地址与端口
+	 *o_remote_address, *o_remote_port;            // 远端连接目标地址与端口
+int o_listen;                                       // 是否为监听（服务端）模式
+int o_buf_size = 4096;                              // 内部发送缓冲区大小（字节）
+int o_numeric;                                      // 是否禁止域名解析
 
+// uTP 上下文与当前活跃的 uTP Socket
 utp_context *ctx;
 utp_socket *s;
 
+// 底层 UDP Socket 文件描述符，以及内部发送缓冲区
 int fd;
 int buf_len = 0;
 unsigned char *buf, *p;
 int eof_flag, utp_eof_flag, utp_shutdown_flag, quit_flag, exit_code;
 
+/**
+ * @brief 打印致命错误信息并退出程序（不会刷新标准输出缓冲）
+ * @param fmt printf 风格的格式串
+ * @param ... 可变参数
+ */
 void die(char *fmt, ...)
 {
 	va_list ap;
@@ -71,6 +78,11 @@ void die(char *fmt, ...)
 	exit(1);
 }
 
+/**
+ * @brief 当启用调试模式时打印调试信息到标准错误
+ * @param fmt printf 风格的格式串
+ * @param ... 可变参数
+ */
 void debug(char *fmt, ...)
 {
 	va_list ap;
@@ -84,6 +96,10 @@ void debug(char *fmt, ...)
 	}
 }
 
+/**
+ * @brief 打印带 errno 描述的系统调用错误信息并退出
+ * @param err 错误描述前缀（通常是出错的系统调用名）
+ */
 void pdie(char *err)
 {
 	debug("errno %d\n", errno);
@@ -92,6 +108,11 @@ void pdie(char *err)
 	exit(1);
 }
 
+/**
+ * @brief 以十六进制格式将内存内容转储到标准错误，便于调试报文内容
+ * @param p   内存首地址
+ * @param len 要转储的字节数
+ */
 void hexdump(const void *p, size_t len)
 {
     int count = 1;
@@ -112,6 +133,10 @@ void hexdump(const void *p, size_t len)
         fprintf(stderr, "\n");
 }
 
+/**
+ * @brief SIGINT 信号处理函数：优雅地关闭 uTP Socket 并退出主循环
+ * @param number 捕获到的信号编号
+ */
 void handler(int number)
 {
 	debug("caught signal\n");
