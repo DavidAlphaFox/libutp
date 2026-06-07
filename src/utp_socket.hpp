@@ -91,7 +91,7 @@ struct ParsedPacket {
 // 连接标识 + 全局状态
 struct ConnectionId {
 	utp::Address addr;              // 对端地址
-	utp_context* ctx = nullptr;     // 所属上下文
+	UtpContext* ctx = nullptr;      // 所属上下文
 	uint32 conn_seed = 0;           // 连接种子（用于生成连接ID）
 	uint32 conn_id_recv = 0;        // 接收方向连接ID
 	uint32 conn_id_send = 0;        // 发送方向连接ID
@@ -139,7 +139,7 @@ struct TimingState {
 
 class UtpSocket {
 public:
-	UtpSocket(utp_context* _ctx);
+	UtpSocket(UtpContext* _ctx);
 	~UtpSocket();
 
 	// ── 数据分组 ──────────────────────────────────────────
@@ -162,7 +162,7 @@ public:
 
 	// ── 兼容性别名（过渡期使用，最终删除）──────────────────
 	utp::Address& addr = conn_.addr;
-	utp_context*& ctx = conn_.ctx;
+	UtpContext*& ctx = conn_.ctx;
 	void*& userdata_ = conn_.userdata;
 	uint32& conn_seed_ = conn_.conn_seed;
 	uint32& conn_id_recv_ = conn_.conn_id_recv;
@@ -266,7 +266,7 @@ public:
 	void send_keep_alive();
 
 	// 发送RST重置包（强制关闭连接，静态方法无需socket实例）
-	static void send_rst(utp_context *ctx,
+	static void send_rst(UtpContext *ctx,
 						 const utp::Address &addr, uint32 conn_id_send_,
 						 uint16 ack_nr_, uint16 seq_nr_);
 

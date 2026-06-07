@@ -770,7 +770,7 @@ int UtpContext::process_udp(const byte *buffer, size_t len, const struct sockadd
 
 			return 1;
 		}
-		UtpSocket *conn = utp_create_socket(this);
+		UtpSocket *conn = static_cast<UtpSocket*>(utp_create_socket(this));
 		utp_initialize_socket(conn, to, tolen, false, id, id+1, id);
 		conn->ack_nr_ = seq_nr_;
 		conn->seq_nr_ = utp_call_get_random(this, NULL);

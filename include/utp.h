@@ -56,10 +56,10 @@ extern "C" {
 #include <stdarg.h>
 #include "utp_types.h"
 
-// uTP Socket 句柄（不透明结构体，具体定义位于库内部）
-typedef struct UtpSocket					utp_socket;
-// uTP Context 句柄（不透明结构体，保存一组 Socket 的全局状态）
-typedef struct UtpContext					utp_context;
+// uTP Socket 句柄（不透明指针，具体定义位于库内部）
+typedef void								utp_socket;
+// uTP Context 句柄（不透明指针，保存一组 Socket 的全局状态）
+typedef void								utp_context;
 
 /*
  * 通用枚举常量

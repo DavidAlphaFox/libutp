@@ -307,7 +307,7 @@ utp_context* utp_init (int version)
 	assert(version == 2);
 	if (version != 2)
 		return NULL;
-	utp_context *ctx = new utp_context;
+	utp_context *ctx = new UtpContext;
 	return ctx;
 }
 
@@ -315,19 +315,20 @@ utp_context* utp_init (int version)
 // 参数: ctx - 上下文指针
 void utp_destroy(utp_context *ctx) {
 	assert(ctx);
-	if (ctx) delete ctx;
+	if (ctx) delete static_cast<UtpContext*>(ctx);
 }
 
 // 设置回调函数
 void utp_set_callback(utp_context *ctx, int callback_name, utp_callback_t *proc) {
 	assert(ctx);
 	if (!ctx) return;
+	UtpContext *c = static_cast<UtpContext*>(ctx);
 	// 首次调用时，将默认 UtpCallbacks 替换为 C 函数指针适配器
-	auto* adapter = dynamic_cast<CFunctionCallbackAdapter*>(ctx->callbacks_.get());
+	auto* adapter = dynamic_cast<CFunctionCallbackAdapter*>(c->callbacks_.get());
 	if (!adapter) {
 		auto new_adapter = std::make_unique<CFunctionCallbackAdapter>();
 		adapter = new_adapter.get();
-		ctx->callbacks_ = std::move(new_adapter);
+		c->callbacks_ = std::move(new_adapter);
 	}
 	adapter->set_handler(callback_name, proc);
 }
@@ -338,8 +339,10 @@ void utp_set_callback(utp_context *ctx, int callback_name, utp_callback_t *proc)
 // 返回: 之前的用户数据指针
 void* utp_context_set_userdata(utp_context *ctx, void *userdata) {
 	assert(ctx);
-	if (ctx) ctx->userdata_ = userdata;
-	return ctx ? ctx->userdata_ : NULL;
+	if (!ctx) return NULL;
+	UtpContext *c = static_cast<UtpContext*>(ctx);
+	c->userdata_ = userdata;
+	return c->userdata_;
 }
 
 // 获取用户自定义数据
@@ -347,7 +350,9 @@ void* utp_context_set_userdata(utp_context *ctx, void *userdata) {
 // 返回: 用户数据指针
 void* utp_context_get_userdata(utp_context *ctx) {
 	assert(ctx);
-	return ctx ? ctx->userdata_ : NULL;
+	if (!ctx) return NULL;
+	UtpContext *c = static_cast<UtpContext*>(ctx);
+	return c->userdata_;
 }
 
 // 获取上下文统计信息
@@ -355,7 +360,9 @@ void* utp_context_get_userdata(utp_context *ctx) {
 // 返回: 统计信息结构体指针
 utp_context_stats* utp_get_context_stats(utp_context *ctx) {
 	assert(ctx);
-	return ctx ? &ctx->context_stats_ : NULL;
+	if (!ctx) return NULL;
+	UtpContext *c = static_cast<UtpContext*>(ctx);
+	return &c->context_stats_;
 }
 
 // 写入数据到 uTP socket
@@ -390,39 +397,40 @@ void utp_initialize_socket(	utp_socket *conn,
 							uint32 conn_id_recv_,
 							uint32 conn_id_send_)
 {
+	UtpSocket *c = static_cast<UtpSocket*>(conn);
 	utp::Address psaddr = utp::Address((const SOCKADDR_STORAGE*)addr, addrlen);
 
 	if (need_seed_gen) {
 		do {
-			conn_seed_ = utp_call_get_random(conn->ctx, conn);
+			conn_seed_ = utp_call_get_random(c->ctx, c);
 			conn_seed_ &= 0xffff;
-		} while (conn->ctx->sockets_.count(UtpSocketKey(psaddr, conn_seed_)));
+		} while (c->ctx->sockets_.count(UtpSocketKey(psaddr, conn_seed_)));
 
 		conn_id_recv_ += conn_seed_;
 		conn_id_send_ += conn_seed_;
 	}
 
-	conn->state_					= CS_IDLE;
-	conn->conn_seed_				= conn_seed_;
-	conn->conn_id_recv_			= conn_id_recv_;
-	conn->conn_id_send_			= conn_id_send_;
-	conn->addr					= psaddr;
-	conn->ctx->current_ms_		= utp_call_get_milliseconds(conn->ctx, NULL);
-	conn->last_got_packet_		= conn->ctx->current_ms_;
-	conn->last_sent_packet_		= conn->ctx->current_ms_;
-	conn->last_measured_delay_	= conn->ctx->current_ms_ + 0x70000000;
-	conn->cc_.init_timing(conn->ctx->current_ms_);
-	conn->cc_.init_delay_histories(conn->ctx->current_ms_);
+	c->state_					= CS_IDLE;
+	c->conn_seed_				= conn_seed_;
+	c->conn_id_recv_			= conn_id_recv_;
+	c->conn_id_send_			= conn_id_send_;
+	c->addr						= psaddr;
+	c->ctx->current_ms_			= utp_call_get_milliseconds(c->ctx, NULL);
+	c->last_got_packet_			= c->ctx->current_ms_;
+	c->last_sent_packet_			= c->ctx->current_ms_;
+	c->last_measured_delay_		= c->ctx->current_ms_ + 0x70000000;
+	c->cc_.init_timing(c->ctx->current_ms_);
+	c->cc_.init_delay_histories(c->ctx->current_ms_);
 
-	conn->mtu_.reset((uint32)conn->get_udp_mtu(), conn->ctx->current_ms_);
-	conn->mtu_.set_last_to_ceiling();
+	c->mtu_.reset((uint32)c->get_udp_mtu(), c->ctx->current_ms_);
+	c->mtu_.set_last_to_ceiling();
 
-	conn->ctx->sockets_[UtpSocketKey(conn->addr, conn->conn_id_recv_)] = conn;
+	c->ctx->sockets_[UtpSocketKey(c->addr, c->conn_id_recv_)] = c;
 
-	conn->cc_.set_max_window(conn->get_packet_size());
+	c->cc_.set_max_window(c->get_packet_size());
 
 	#if UTP_DEBUG_LOGGING
-	conn->log(UTP_LOG_DEBUG, "UTP socket initialized");
+	c->log(UTP_LOG_DEBUG, "UTP socket initialized");
 	#endif
 }
 
@@ -436,7 +444,8 @@ utp_socket*	utp_create_socket(utp_context *ctx)
 	assert(ctx);
 	if (!ctx) return NULL;
 
-	UtpSocket *conn = new UtpSocket(ctx);
+	UtpContext *c = static_cast<UtpContext*>(ctx);
+	UtpSocket *conn = new UtpSocket(c);
 	conn->fast_resend_seq_nr_ = conn->seq_nr_;
 
 	return conn;
@@ -452,32 +461,33 @@ int utp_context_set_option(utp_context *ctx, int opt, int val)
 {
 	assert(ctx);
 	if (!ctx) return -1;
+	UtpContext *c = static_cast<UtpContext*>(ctx);
 
 	switch (opt) {
     	case UTP_LOG_NORMAL:
-			ctx->log_normal_ = val ? true : false;
+			c->log_normal_ = val ? true : false;
 			return 0;
 
     	case UTP_LOG_MTU:
-			ctx->log_mtu_ = val ? true : false;
+			c->log_mtu_ = val ? true : false;
 			return 0;
 
     	case UTP_LOG_DEBUG:
-			ctx->log_debug_ = val ? true : false;
+			c->log_debug_ = val ? true : false;
 			return 0;
 
     	case UTP_TARGET_DELAY:
-			ctx->target_delay_ = val;
+			c->target_delay_ = val;
 			return 0;
 
 		case UTP_SNDBUF:
 			assert(val >= 1);
-			ctx->opt_sndbuf_ = val;
+			c->opt_sndbuf_ = val;
 			return 0;
 
 		case UTP_RCVBUF:
 			assert(val >= 1);
-			ctx->opt_rcvbuf_ = val;
+			c->opt_rcvbuf_ = val;
 			return 0;
 	}
 	return -1;
@@ -492,14 +502,15 @@ int utp_context_get_option(utp_context *ctx, int opt)
 {
 	assert(ctx);
 	if (!ctx) return -1;
+	UtpContext *c = static_cast<UtpContext*>(ctx);
 
 	switch (opt) {
-    	case UTP_LOG_NORMAL:	return ctx->log_normal_ ? 1 : 0;
-    	case UTP_LOG_MTU:		return ctx->log_mtu_    ? 1 : 0;
-    	case UTP_LOG_DEBUG:		return ctx->log_debug_  ? 1 : 0;
-    	case UTP_TARGET_DELAY:	return ctx->target_delay_;
-		case UTP_SNDBUF:		return ctx->opt_sndbuf_;
-		case UTP_RCVBUF:		return ctx->opt_rcvbuf_;
+    	case UTP_LOG_NORMAL:	return c->log_normal_ ? 1 : 0;
+    	case UTP_LOG_MTU:		return c->log_mtu_    ? 1 : 0;
+    	case UTP_LOG_DEBUG:		return c->log_debug_  ? 1 : 0;
+    	case UTP_TARGET_DELAY:	return c->target_delay_;
+		case UTP_SNDBUF:		return c->opt_sndbuf_;
+		case UTP_RCVBUF:		return c->opt_rcvbuf_;
 	}
 	return -1;
 }
@@ -637,12 +648,13 @@ int utp_connect(utp_socket *s, const struct sockaddr *to, socklen_t tolen) {
 // 返回值：
 //   成功入队的总字节数；socket 未连接或已发送 FIN 时返回 0；参数错误返回 -1
 // -----------------------------------------------------------------------------
-ssize_t utp_writev(utp_socket *conn, struct utp_iovec *iovec_input, size_t num_iovecs)
+ssize_t utp_writev(utp_socket *s, struct utp_iovec *iovec_input, size_t num_iovecs)
 {
 	static utp_iovec iovec[UTP_IOV_MAX];
 
-	assert(conn);
-	if (!conn) return -1;
+	assert(s);
+	if (!s) return -1;
+	UtpSocket *conn = static_cast<UtpSocket*>(s);
 
 	assert(iovec_input);
 	if (!iovec_input) return -1;
@@ -840,12 +852,13 @@ int utp_getpeername(utp_socket *conn, struct sockaddr *addr, socklen_t *addrlen)
 
 	assert(conn);
 	if (!conn) return -1;
+	UtpSocket *c = static_cast<UtpSocket*>(conn);
 
-	assert(conn->state_ != CS_UNINITIALIZED);
-	if (conn->state_ == CS_UNINITIALIZED) return -1;
+	assert(c->state_ != CS_UNINITIALIZED);
+	if (c->state_ == CS_UNINITIALIZED) return -1;
 
 	socklen_t len;
-	const SOCKADDR_STORAGE sa = conn->addr.get_sockaddr_storage(&len);
+	const SOCKADDR_STORAGE sa = c->addr.get_sockaddr_storage(&len);
 	*addrlen = min(len, *addrlen);
 	memcpy(addr, &sa, *addrlen);
 	return 0;
@@ -986,7 +999,9 @@ void utp_shutdown(utp_socket *s, int how) {
 // -----------------------------------------------------------------------------
 utp_context* utp_get_context(utp_socket *socket) {
 	assert(socket);
-	return socket ? socket->ctx : NULL;
+	if (!socket) return NULL;
+	UtpSocket *s = static_cast<UtpSocket*>(socket);
+	return s->ctx;
 }
 
 // -----------------------------------------------------------------------------
@@ -1002,8 +1017,10 @@ utp_context* utp_get_context(utp_socket *socket) {
 // -----------------------------------------------------------------------------
 void* utp_set_userdata(utp_socket *socket, void *userdata_) {
 	assert(socket);
-	if (socket) socket->userdata_ = userdata_;
-	return socket ? socket->userdata_ : NULL;
+	if (!socket) return NULL;
+	UtpSocket *s = static_cast<UtpSocket*>(socket);
+	s->userdata_ = userdata_;
+	return s->userdata_;
 }
 
 // -----------------------------------------------------------------------------
@@ -1018,7 +1035,9 @@ void* utp_set_userdata(utp_socket *socket, void *userdata_) {
 // -----------------------------------------------------------------------------
 void* utp_get_userdata(utp_socket *socket) {
 	assert(socket);
-	return socket ? socket->userdata_ : NULL;
+	if (!socket) return NULL;
+	UtpSocket *s = static_cast<UtpSocket*>(socket);
+	return s->userdata_;
 }
 
 // -----------------------------------------------------------------------------
@@ -1097,11 +1116,12 @@ inline bool UtpContext::would_log(int level)
 // 返回值：
 //   统计信息结构体指针；非 _DEBUG 编译时返回 NULL
 // -----------------------------------------------------------------------------
-utp_socket_stats* utp_get_stats(utp_socket *socket)
+utp_socket_stats* utp_get_stats(utp_socket *s)
 {
 	#ifdef _DEBUG
-		assert(socket);
-		if (!socket) return NULL;
+		assert(s);
+		if (!s) return NULL;
+		UtpSocket *socket = static_cast<UtpSocket*>(s);
 		socket->stats_.mtu_guess = socket->mtu_.raw_mtu();
 		return &socket->stats_;
 	#else

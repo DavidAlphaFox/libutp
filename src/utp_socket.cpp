@@ -452,7 +452,7 @@ void UtpSocket::send_keep_alive()
 //   ack_nr_        - 当前确认序号（通常为收到的对端 seq）。
 //   seq_nr_        - 当前发送序号。
 // -----------------------------------------------------------------------------
-void UtpSocket::send_rst(utp_context *ctx,
+void UtpSocket::send_rst(UtpContext *ctx,
 	const utp::Address &addr, uint32 conn_id_send_, uint16 ack_nr_, uint16 seq_nr_)
 {
 	PacketFormatV1 pf1;
@@ -1151,7 +1151,7 @@ size_t UtpSocket::get_packet_size() const
 //   5. 初始化 MTU 探测器和拥塞控制器。
 //   6. DEBUG 模式下清零统计结构体。
 // -----------------------------------------------------------------------------
-UtpSocket::UtpSocket(utp_context* _ctx)
+UtpSocket::UtpSocket(UtpContext* _ctx)
 	: conn_{.ctx = _ctx, .target_delay = _ctx->target_delay_}
 	, recv_{.opt_rcvbuf = _ctx->opt_rcvbuf_}
 	, send_{.opt_sndbuf = _ctx->opt_sndbuf_, .max_window_user = 255 * PACKET_SIZE}
