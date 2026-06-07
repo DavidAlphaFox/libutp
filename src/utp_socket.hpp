@@ -142,6 +142,113 @@ public:
 	UtpSocket(UtpContext* _ctx);
 	~UtpSocket();
 
+	// ── 内联工具方法 ──────────────────────────────────
+
+	void log(int level, char const *fmt, ...)
+	{
+		va_list va;
+		char buf[4096], buf2[4096];
+
+		if (!conn_.ctx->would_log(level)) {
+			return;
+		}
+
+		va_start(va, fmt);
+		vsnprintf(buf, 4096, fmt, va);
+		va_end(va);
+		buf[4095] = '\0';
+
+		snprintf(buf2, 4096, "%p %s %06u %s", this, addrfmt(conn_.addr, addrbuf), conn_.conn_id_recv, buf);
+		buf2[4095] = '\0';
+
+		conn_.ctx->log_unchecked(this, buf2);
+	}
+
+	size_t get_rcv_window()
+	{
+		const size_t numbuf = utp_call_get_read_buffer_size(conn_.ctx, this);
+		assert((int)numbuf >= 0);
+		return recv_.opt_rcvbuf > numbuf ? recv_.opt_rcvbuf - numbuf : 0;
+	}
+
+	size_t get_header_size() const
+	{
+		return sizeof(utp::wire::PacketFormatV1);
+	}
+
+	size_t get_udp_mtu()
+	{
+		socklen_t len;
+		SOCKADDR_STORAGE sa = conn_.addr.get_sockaddr_storage(&len);
+		return utp_call_get_udp_mtu(conn_.ctx, this, (const struct sockaddr *)&sa, len);
+	}
+
+	size_t get_udp_overhead()
+	{
+		socklen_t len;
+		SOCKADDR_STORAGE sa = conn_.addr.get_sockaddr_storage(&len);
+		return utp_call_get_udp_overhead(conn_.ctx, this, (const struct sockaddr *)&sa, len);
+	}
+
+	size_t get_overhead()
+	{
+		return get_udp_overhead() + get_header_size();
+	}
+
+	// ── 外部接口方法（C API 包装 / UtpContext 调用）──
+
+	void schedule_ack();
+
+	void send_ack(bool synack = false);
+	void send_keep_alive();
+	static void send_rst(UtpContext *ctx,
+						 const utp::Address &addr, uint32 conn_id_send_,
+						 uint16 ack_nr_, uint16 seq_nr_);
+
+	size_t get_packet_size() const;
+
+	#ifdef _DEBUG
+	void check_invariant();
+	#endif
+
+	void check_timeouts();
+	void remove_from_ack_list();
+	void register_recv_packet(size_t len);
+	size_t process_incoming(const byte *packet, size_t len, bool syn = false);
+	int connect(const struct sockaddr *to, socklen_t tolen);
+	void close();
+	void shutdown(int how);
+	void read_drained();
+
+	// ── 友元：允许 UtpContext 和 C API 包装函数访问私有成员 ──
+	friend class UtpContext;
+	friend void utp_initialize_socket(utp_socket*, const struct sockaddr*, socklen_t, bool, uint32, uint32, uint32);
+	friend ssize_t utp_writev(utp_socket*, struct utp_iovec*, size_t);
+	friend utp_socket* utp_create_socket(utp_context*);
+	friend int utp_getpeername(utp_socket*, struct sockaddr*, socklen_t*);
+	friend utp_context* utp_get_context(utp_socket*);
+	friend void* utp_set_userdata(utp_socket*, void*);
+	friend void* utp_get_userdata(utp_socket*);
+	friend utp_socket_stats* utp_get_stats(utp_socket*);
+	friend int utp_setsockopt(UtpSocket*, int, int);
+	friend int utp_getsockopt(UtpSocket*, int);
+	friend int utp_get_delays(UtpSocket*, uint32*, uint32*, uint32*);
+
+private:
+	// ── 内部实现方法（仅被自身成员函数调用）──
+	void send_data(byte* b, size_t length, BandwidthType type, uint32 flags = 0);
+	void send_packet(OutgoingPacket *pkt);
+	bool is_full(int bytes = -1);
+	bool flush_packets();
+	void write_outgoing_packet(size_t payload, uint flags, struct utp_iovec *iovec, size_t num_iovecs);
+	int ack_packet(uint16 seq);
+	size_t selective_ack_bytes(uint base, const byte* mask, byte len, int64& min_rtt);
+	void selective_ack(uint base, const byte *mask, byte len);
+	bool parse_packet(const byte* packet, size_t len, ParsedPacket& pp);
+	size_t process_acks(const ParsedPacket& pp, int acks, uint64 time);
+	void advance_send_window(const ParsedPacket& pp, int acks);
+	size_t deliver_data(const ParsedPacket& pp, uint seqnr);
+
 	// ── 数据分组 ──────────────────────────────────────────
 	ConnectionId  conn_;            // 连接标识 + 全局状态
 	ReceiveState  recv_;            // 接收侧状态
@@ -193,126 +300,4 @@ public:
 	uint16& timeout_seq_nr_ = timing_.timeout_seq_nr;
 	uint16& fast_resend_seq_nr_ = timing_.fast_resend_seq_nr;
 	// 注意：fast_timeout_ 是位域，使用 timing_.fast_timeout
-
-	// ── 内联方法 ──────────────────────────────────────────
-
-	// 记录日志（带格式化），自动添加socket标识信息
-	void log(int level, char const *fmt, ...)
-	{
-		va_list va;
-		char buf[4096], buf2[4096];
-
-		if (!conn_.ctx->would_log(level)) {
-			return;
-		}
-
-		va_start(va, fmt);
-		vsnprintf(buf, 4096, fmt, va);
-		va_end(va);
-		buf[4095] = '\0';
-
-		snprintf(buf2, 4096, "%p %s %06u %s", this, addrfmt(conn_.addr, addrbuf), conn_.conn_id_recv, buf);
-		buf2[4095] = '\0';
-
-		conn_.ctx->log_unchecked(this, buf2);
-	}
-
-	// 调度发送ACK（将本socket加入延迟ACK列表，批量确认）
-	void schedule_ack();
-
-	// 获取当前接收窗口大小（接收缓冲区剩余空间）
-	size_t get_rcv_window()
-	{
-		const size_t numbuf = utp_call_get_read_buffer_size(conn_.ctx, this);
-		assert((int)numbuf >= 0);
-		return recv_.opt_rcvbuf > numbuf ? recv_.opt_rcvbuf - numbuf : 0;
-	}
-
-	// 获取包头大小（uTP V1包格式固定大小）
-	size_t get_header_size() const
-	{
-		return sizeof(utp::wire::PacketFormatV1);
-	}
-
-	// 获取UDP MTU（通过回调查询底层UDP的MTU）
-	size_t get_udp_mtu()
-	{
-		socklen_t len;
-		SOCKADDR_STORAGE sa = conn_.addr.get_sockaddr_storage(&len);
-		return utp_call_get_udp_mtu(conn_.ctx, this, (const struct sockaddr *)&sa, len);
-	}
-
-	// 获取UDP开销（IP层+UDP层头部大小）
-	size_t get_udp_overhead()
-	{
-		socklen_t len;
-		SOCKADDR_STORAGE sa = conn_.addr.get_sockaddr_storage(&len);
-		return utp_call_get_udp_overhead(conn_.ctx, this, (const struct sockaddr *)&sa, len);
-	}
-
-	// 获取总开销（UDP开销 + uTP包头大小）
-	size_t get_overhead()
-	{
-		return get_udp_overhead() + get_header_size();
-	}
-
-	// 发送原始数据到对端（通过UDP回调）
-	void send_data(byte* b, size_t length, BandwidthType type, uint32 flags = 0);
-
-	// 发送ACK确认包（synack=true时发送SYNACK）
-	void send_ack(bool synack = false);
-
-	// 发送保活包（防止连接因空闲而超时断开）
-	void send_keep_alive();
-
-	// 发送RST重置包（强制关闭连接，静态方法无需socket实例）
-	static void send_rst(UtpContext *ctx,
-						 const utp::Address &addr, uint32 conn_id_send_,
-						 uint16 ack_nr_, uint16 seq_nr_);
-
-	// 发送一个已构造好的出站数据包（处理重传逻辑和带宽统计）
-	void send_packet(OutgoingPacket *pkt);
-
-	// 检查发送窗口是否已满（bytes=-1时使用默认包大小）
-	bool is_full(int bytes = -1);
-	// 刷新发送队列（尽可能发送缓冲区中的包）
-	bool flush_packets();
-	// 构造并发送出站数据包（从iovec填充数据）
-	void write_outgoing_packet(size_t payload, uint flags, struct utp_iovec *iovec, size_t num_iovecs);
-
-	#ifdef _DEBUG
-	// 检查socket内部状态一致性（调试用不变量检查）
-	void check_invariant();
-	#endif
-
-	// 检查并处理超时（重传、连接超时、保活等）
-	void check_timeouts();
-	// 确认指定序列号的包（从outbuf_中移除，更新窗口）
-	int ack_packet(uint16 seq);
-	// 计算选择性确认(SACK)覆盖的字节数（用于拥塞控制）
-	size_t selective_ack_bytes(uint base, const byte* mask, byte len, int64& min_rtt);
-	// 处理选择性确认(SACK)（标记已确认的包，触发快速重传）
-	void selective_ack(uint base, const byte *mask, byte len);
-	// 获取当前包大小（考虑MTU探测结果）
-	size_t get_packet_size() const;
-
-	// 从延迟ACK列表中移除本socket
-	void remove_from_ack_list();
-	// 注册收到的数据包（带宽统计）
-	void register_recv_packet(size_t len);
-	// 处理入站数据包（核心接收逻辑）
-	size_t process_incoming(const byte *packet, size_t len, bool syn = false);
-	// 发起出站连接
-	int connect(const struct sockaddr *to, socklen_t tolen);
-	// 关闭连接（发送FIN，等待数据排空后销毁）
-	void close();
-	// 关闭写端或读端
-	void shutdown(int how);
-	// 通知接收缓冲区已消费，可能触发窗口更新
-	void read_drained();
-
-	bool parse_packet(const byte* packet, size_t len, ParsedPacket& pp);
-	size_t process_acks(const ParsedPacket& pp, int acks, uint64 time);
-	void advance_send_window(const ParsedPacket& pp, int acks);
-	size_t deliver_data(const ParsedPacket& pp, uint seqnr);
 };

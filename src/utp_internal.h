@@ -104,32 +104,6 @@ using SocketMap = std::unordered_map<UtpSocketKey, UtpSocket*, UtpSocketKeyHash>
 // 已发送 RST 缓存,以及当前时间缓存等公共状态。应用层通过 utp_create_context 间接创建。
 class UtpContext {
 public:
-	void *userdata_;
-	std::unique_ptr<UtpCallbacks> callbacks_;
-
-	// current_ms_: 当前毫秒时钟的缓存,避免每个操作都向系统查询时间;
-	// utp_check_timeouts 会统一刷新,其它路径若需要时间应先更新该值。
-	uint64 current_ms_; //当前时钟的缓存
-	utp_context_stats context_stats_;
-
-	// last_utp_socket_: 上一被处理过的套接字指针,作为接收数据包时查找的"快路径"缓存。
-	// 由于同一对端通常会连续收发包,先比较此缓存可避免每次都做哈希表查找。
-	UtpSocket *last_utp_socket_;
-
-	// ack_sockets_: 收到数据后等待发送 ACK 的套接字列表。utp_issue_deferred_acks 时
-	// 统一遍历,实现 ACK 合并 (delayed ACK) 以减少纯 ACK 包数量。
-	std::vector<UtpSocket*> ack_sockets_; //等待发送ack的sockets
-	// rst_info_: 已发送 RST 的历史缓存,用于抑制对同一四元组重复回 RST。
-	std::vector<RstInfo> rst_info_;
-	SocketMap sockets_;
-	// target_delay_: LEDBAT 拥塞控制的目标排队延迟,默认 100ms (CCONTROL_TARGET)。
-	size_t target_delay_;
-	// opt_sndbuf_ / opt_rcvbuf_: 套接字发送/接收缓冲区的默认上限。
-	size_t opt_sndbuf_;
-	size_t opt_rcvbuf_;
-	// last_check_: 上次 utp_check_timeouts 调用的时间戳,用于节流 (TIMEOUT_CHECK_INTERVAL)。
-	uint64 last_check_;
-
 	UtpContext();
 	~UtpContext();
 
@@ -147,9 +121,40 @@ public:
 
 	UtpSocket* parse_icmp_payload(const byte *buffer, size_t len, const struct sockaddr *to, socklen_t tolen);
 
-	bool log_normal_:1;	// log normal events?
-	bool log_mtu_:1;		// log MTU related events?
-	bool log_debug_:1;	// log debugging events? (Must also compile with UTP_DEBUG_LOGGING defined)
+	UtpCallbacks* callbacks() { return callbacks_.get(); }
+
+	friend class UtpSocket;
+	friend void utp_set_callback(utp_context*, int, utp_callback_t*);
+	friend void* utp_context_set_userdata(utp_context*, void*);
+	friend void* utp_context_get_userdata(utp_context*);
+	friend utp_context_stats* utp_get_context_stats(utp_context*);
+	friend int utp_context_set_option(utp_context*, int, int);
+	friend int utp_context_get_option(utp_context*, int);
+	friend utp_socket* utp_create_socket(utp_context*);
+	friend void utp_initialize_socket(utp_socket*, const struct sockaddr*, socklen_t, bool, uint32, uint32, uint32);
+	friend ssize_t utp_writev(utp_socket*, struct utp_iovec*, size_t);
+	friend int utp_get_delays(UtpSocket*, uint32*, uint32*, uint32*);
+
+private:
+	void *userdata_;
+	std::unique_ptr<UtpCallbacks> callbacks_;
+
+	uint64 current_ms_;
+	utp_context_stats context_stats_;
+
+	UtpSocket *last_utp_socket_;
+
+	std::vector<UtpSocket*> ack_sockets_;
+	std::vector<RstInfo> rst_info_;
+	SocketMap sockets_;
+	size_t target_delay_;
+	size_t opt_sndbuf_;
+	size_t opt_rcvbuf_;
+	uint64 last_check_;
+
+	bool log_normal_:1;
+	bool log_mtu_:1;
+	bool log_debug_:1;
 };
 
 #endif //__UTP_INTERNAL_H__
