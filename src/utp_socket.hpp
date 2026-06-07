@@ -70,71 +70,119 @@ struct InboundPacket {
 	std::vector<uint8_t> data;     // 数据包内容
 };
 
+// =============================================================================
+// 数据分组 struct：将 UtpSocket 的 ~40 个字段按职责归入 4 个纯数据分组。
+// 这些 struct 没有行为方法——协议逻辑天然跨 send/receive 边界，
+// 因此方法留在 UtpSocket 上，struct 仅用于认知分组和初始化。
+// =============================================================================
+
+// 连接标识 + 全局状态
+struct ConnectionId {
+	utp::Address addr;              // 对端地址
+	utp_context* ctx = nullptr;     // 所属上下文
+	uint32 conn_seed = 0;           // 连接种子（用于生成连接ID）
+	uint32 conn_id_recv = 0;        // 接收方向连接ID
+	uint32 conn_id_send = 0;        // 发送方向连接ID
+	void* userdata = nullptr;       // 用户数据指针
+	CONN_STATE state = CS_UNINITIALIZED;  // 当前连接状态
+	size_t target_delay = 0;        // LEDBAT 目标延迟（微秒）
+	byte extensions[8] = {};        // 扩展位标志
+};
+
+// 接收侧状态
+struct ReceiveState {
+	uint16 ack_nr = 0;              // 期望收到的下一个序列号
+	uint16 reorder_count = 0;       // 乱序包计数
+	uint16 eof_pkt = 0;             // FIN 包的序列号
+	bool got_fin : 1 = false;       // 是否收到对端的 FIN 包
+	bool got_fin_reached_ : 1 = false;  // 是否已处理到 FIN 包位置
+	bool read_shutdown : 1 = false;    // 读端是否已关闭
+	size_t opt_rcvbuf = 0;          // 接收缓冲区大小
+	size_t last_rcv_win = 0;        // 最后通告的接收窗口大小
+	utp::RawSequenceBuffer inbuf;   // 入站序列缓冲区
+};
+
+// 发送侧状态
+struct SendState {
+	uint16 seq_nr = 1;              // 下一个待发送包的序列号
+	uint16 cur_window_packets = 0;  // 当前在飞（未确认）的包数量
+	bool fin_sent : 1 = false;      // 是否已发送 FIN 包
+	bool fin_sent_acked_ : 1 = false;  // 已发送的 FIN 是否已被确认
+	bool close_requested_ : 1 = false;  // 用户是否请求关闭连接
+	size_t opt_sndbuf = 0;          // 发送缓冲区大小
+	size_t max_window_user = 0;     // 用户设定的最大发送窗口
+	utp::RawSequenceBuffer outbuf;  // 出站序列缓冲区
+};
+
+// 超时 / 延迟测量状态
+struct TimingState {
+	uint32 reply_micro = 0;         // 延迟反馈值（微秒）
+	uint64 last_measured_delay = 0; // 最后一次测量延迟的时间戳
+	uint64 last_got_packet = 0;     // 最后一次收到数据包的时间戳
+	uint64 last_sent_packet = 0;    // 最后一次发送数据包的时间戳
+	bool fast_timeout_ : 1 = false;  // 是否启用快速超时
+	uint16 timeout_seq_nr = 0;      // 超时检查时记录的序列号
+	uint16 fast_resend_seq_nr = 1;  // 快速重传起始序列号
+};
+
 class UtpSocket {
 public:
 	UtpSocket(utp_context* _ctx);
 	~UtpSocket();
 
-	utp::Address addr;              // 对端地址
-	utp_context *ctx;               // 所属上下文
+	// ── 数据分组 ──────────────────────────────────────────
+	ConnectionId  conn_;            // 连接标识 + 全局状态
+	ReceiveState  recv_;            // 接收侧状态
+	SendState     send_;            // 发送侧状态
+	TimingState   timing_;          // 超时 / 延迟测量
 
-	int ida;                        // 延迟ACK列表索引（用于批量发送ACK）
+	// ACK 管理（仅 2 字段，跨 send/recv 边界，保留在顶层）
+	int   ida_ = -1;                // 延迟ACK列表索引
+	byte  duplicate_ack_ = 0;       // 重复ACK计数
 
-	uint16 reorder_count_;          // 乱序包计数（收到非期望序列号的包）
-	byte duplicate_ack_;            // 重复ACK计数（用于快速重传检测）
-	uint16 cur_window_packets_;     // 当前在飞（未确认）的包数量
-
-	size_t opt_sndbuf_;             // 发送缓冲区大小（用户设定）
-	size_t opt_rcvbuf_;             // 接收缓冲区大小（用户设定）
-
-	size_t target_delay_;           // 目标延迟（LEDBAT拥塞控制目标，微秒）
-
-	bool got_fin:1;                 // 是否收到对端的FIN包
-	bool got_fin_reached_:1;        // 是否已处理到FIN包位置（所有前置数据已接收）
-
-	bool fin_sent:1;                // 是否已发送FIN包
-	bool fin_sent_acked_:1;         // 已发送的FIN是否已被确认
-
-	bool read_shutdown_:1;          // 读端是否已关闭（收到FIN且数据读完）
-	bool close_requested_:1;        // 用户是否请求关闭连接
-
-	bool fast_timeout_:1;           // 是否启用快速超时（缩短重传超时时间）
-
-	size_t max_window_user_;        // 用户设定的最大发送窗口
-	CONN_STATE state_;              // 当前连接状态
-
-	uint16 eof_pkt_;                // FIN包的序列号（end-of-file packet）
-
-	uint16 ack_nr_;                 // 期望收到的下一个序列号（已确认的最大序列号+1）
-	uint16 seq_nr_;                 // 下一个待发送包的序列号
-
-	uint16 timeout_seq_nr_;         // 超时检查时记录的序列号（用于区分超时包）
-
-	uint16 fast_resend_seq_nr_;     // 快速重传起始序列号
-
-	uint32 reply_micro_;            // 延迟反馈值（对端计算的单向延迟，微秒）
-
-	uint64 last_got_packet_;        // 最后一次收到数据包的时间戳（微秒）
-	uint64 last_sent_packet_;       // 最后一次发送数据包的时间戳（微秒）
-	uint64 last_measured_delay_;    // 最后一次测量延迟的时间戳（微秒）
-
-	void *userdata_;                // 用户数据指针（由应用层设置）
-
-	uint32 conn_seed_;              // 连接种子（用于生成连接ID）
-	uint32 conn_id_recv_;           // 接收方向连接ID（用于匹配入站包）
-	uint32 conn_id_send_;           // 发送方向连接ID（用于匹配出站包）
-	size_t last_rcv_win_;           // 最后通告给对端的接收窗口大小
-
-	byte extensions_[8];            // 扩展位标志（支持选择性确认等扩展）
-
-	MtuDiscovery mtu_;              // MTU探测对象（用于路径MTU发现）
+	// 已提取的子组件
+	MtuDiscovery    mtu_;           // MTU探测对象
 	LedbatController cc_;           // LEDBAT拥塞控制对象
-
-	utp::RawSequenceBuffer inbuf_, outbuf_;  // 入站/出站序列缓冲区（按序列号索引）
 
 	#ifdef _DEBUG
 	utp_socket_stats stats_;        // 统计信息（仅DEBUG模式）
 	#endif
+
+	// ── 兼容性别名（过渡期使用，最终删除）──────────────────
+	utp::Address& addr = conn_.addr;
+	utp_context*& ctx = conn_.ctx;
+	void*& userdata_ = conn_.userdata;
+	uint32& conn_seed_ = conn_.conn_seed;
+	uint32& conn_id_recv_ = conn_.conn_id_recv;
+	uint32& conn_id_send_ = conn_.conn_id_send;
+	CONN_STATE& state_ = conn_.state;
+	size_t& target_delay_ = conn_.target_delay;
+	byte (&extensions_)[8] = conn_.extensions;
+
+	uint16& ack_nr_ = recv_.ack_nr;
+	uint16& reorder_count_ = recv_.reorder_count;
+	uint16& eof_pkt_ = recv_.eof_pkt;
+	size_t& opt_rcvbuf_ = recv_.opt_rcvbuf;
+	size_t& last_rcv_win_ = recv_.last_rcv_win;
+	utp::RawSequenceBuffer& inbuf_ = recv_.inbuf;
+	// got_fin / got_fin_reached_ / read_shutdown 是位域，直接使用 recv_.xxx
+
+	uint16& seq_nr_ = send_.seq_nr;
+	uint16& cur_window_packets_ = send_.cur_window_packets;
+	size_t& opt_sndbuf_ = send_.opt_sndbuf;
+	size_t& max_window_user_ = send_.max_window_user;
+	utp::RawSequenceBuffer& outbuf_ = send_.outbuf;
+	// 注意：fin_sent / fin_sent_acked_ / close_requested_ 是位域，使用 send_.xxx
+
+	uint32& reply_micro_ = timing_.reply_micro;
+	uint64& last_measured_delay_ = timing_.last_measured_delay;
+	uint64& last_got_packet_ = timing_.last_got_packet;
+	uint64& last_sent_packet_ = timing_.last_sent_packet;
+	uint16& timeout_seq_nr_ = timing_.timeout_seq_nr;
+	uint16& fast_resend_seq_nr_ = timing_.fast_resend_seq_nr;
+	// 注意：fast_timeout_ 是位域，使用 timing_.fast_timeout
+
+	// ── 内联方法 ──────────────────────────────────────────
 
 	// 记录日志（带格式化），自动添加socket标识信息
 	void log(int level, char const *fmt, ...)
@@ -142,7 +190,7 @@ public:
 		va_list va;
 		char buf[4096], buf2[4096];
 
-		if (!ctx->would_log(level)) {
+		if (!conn_.ctx->would_log(level)) {
 			return;
 		}
 
@@ -151,10 +199,10 @@ public:
 		va_end(va);
 		buf[4095] = '\0';
 
-		snprintf(buf2, 4096, "%p %s %06u %s", this, addrfmt(addr, addrbuf), conn_id_recv_, buf);
+		snprintf(buf2, 4096, "%p %s %06u %s", this, addrfmt(conn_.addr, addrbuf), conn_.conn_id_recv, buf);
 		buf2[4095] = '\0';
 
-		ctx->log_unchecked(this, buf2);
+		conn_.ctx->log_unchecked(this, buf2);
 	}
 
 	// 调度发送ACK（将本socket加入延迟ACK列表，批量确认）
@@ -163,9 +211,9 @@ public:
 	// 获取当前接收窗口大小（接收缓冲区剩余空间）
 	size_t get_rcv_window()
 	{
-		const size_t numbuf = utp_call_get_read_buffer_size(this->ctx, this);
+		const size_t numbuf = utp_call_get_read_buffer_size(conn_.ctx, this);
 		assert((int)numbuf >= 0);
-		return opt_rcvbuf_ > numbuf ? opt_rcvbuf_ - numbuf : 0;
+		return recv_.opt_rcvbuf > numbuf ? recv_.opt_rcvbuf - numbuf : 0;
 	}
 
 	// 获取包头大小（uTP V1包格式固定大小）
@@ -178,16 +226,16 @@ public:
 	size_t get_udp_mtu()
 	{
 		socklen_t len;
-		SOCKADDR_STORAGE sa = addr.get_sockaddr_storage(&len);
-		return utp_call_get_udp_mtu(this->ctx, this, (const struct sockaddr *)&sa, len);
+		SOCKADDR_STORAGE sa = conn_.addr.get_sockaddr_storage(&len);
+		return utp_call_get_udp_mtu(conn_.ctx, this, (const struct sockaddr *)&sa, len);
 	}
 
 	// 获取UDP开销（IP层+UDP层头部大小）
 	size_t get_udp_overhead()
 	{
 		socklen_t len;
-		SOCKADDR_STORAGE sa = addr.get_sockaddr_storage(&len);
-		return utp_call_get_udp_overhead(this->ctx, this, (const struct sockaddr *)&sa, len);
+		SOCKADDR_STORAGE sa = conn_.addr.get_sockaddr_storage(&len);
+		return utp_call_get_udp_overhead(conn_.ctx, this, (const struct sockaddr *)&sa, len);
 	}
 
 	// 获取总开销（UDP开销 + uTP包头大小）
@@ -235,4 +283,19 @@ public:
 	void selective_ack(uint base, const byte *mask, byte len);
 	// 获取当前包大小（考虑MTU探测结果）
 	size_t get_packet_size() const;
+
+	// 从延迟ACK列表中移除本socket
+	void remove_from_ack_list();
+	// 注册收到的数据包（带宽统计）
+	void register_recv_packet(size_t len);
+	// 处理入站数据包（核心接收逻辑）
+	size_t process_incoming(const byte *packet, size_t len, bool syn = false);
+	// 发起出站连接
+	int connect(const struct sockaddr *to, socklen_t tolen);
+	// 关闭连接（发送FIN，等待数据排空后销毁）
+	void close();
+	// 关闭写端或读端
+	void shutdown(int how);
+	// 通知接收缓冲区已消费，可能触发窗口更新
+	void read_drained();
 };

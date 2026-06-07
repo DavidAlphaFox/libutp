@@ -114,26 +114,24 @@ static const cstr statenames[] = {
 //   - 修改 conn->ida（置为 -1 表示不在列表中）。
 //   - 修改 ctx->ack_sockets_ 容器内容。
 // -----------------------------------------------------------------------------
-void remove_socket_from_ack_list(UtpSocket *conn)
+void UtpSocket::remove_from_ack_list()
 {
-	if (conn->ida >= 0)
+	if (ida_ >= 0)
 	{
 		// 取出列表末尾元素，用于填补待删除元素的位置
-		UtpSocket *last = conn->ctx->ack_sockets_.back();
+		UtpSocket *last = conn_.ctx->ack_sockets_.back();
 
 		// 防御性检查：确保 ida 索引与容器实际状态一致
-		assert(last->ida < (int)(conn->ctx->ack_sockets_.size()));
-		assert(conn->ctx->ack_sockets_[last->ida] == last);
+		assert(last->ida_ < (int)(conn_.ctx->ack_sockets_.size()));
+		assert(conn_.ctx->ack_sockets_[last->ida_] == last);
 
-		// 用 last 覆盖待删除元素的位置，并同步更新 last 的 ida
-		last->ida = conn->ida;
-		conn->ctx->ack_sockets_[conn->ida] = last;
+		last->ida_ = ida_;
+		conn_.ctx->ack_sockets_[ida_] = last;
 
-		// 标记当前 socket 已不在列表中
-		conn->ida = -1;
+		ida_ = -1;
 
 		// 弹出末尾元素（swap-pop 完成）
-		conn->ctx->ack_sockets_.pop_back();
+		conn_.ctx->ack_sockets_.pop_back();
 	}
 }
 
@@ -160,22 +158,22 @@ void remove_socket_from_ack_list(UtpSocket *conn)
 //   该函数仅在 UTP_ENABLE_STATS 编译选项启用时被调用，目前总是被调用
 //   （由 send_to_addr 调用），通过条件编译控制编译产物。
 // -----------------------------------------------------------------------------
-static void utp_register_sent_packet(utp_context *ctx, size_t length)
+void UtpContext::register_sent_packet(size_t length)
 {
 	// 尺寸 < MID 区间：进一步细分为 EMPTY / SMALL / MID 三个桶
 	if (length <= PACKET_SIZE_MID) {
 		if (length <= PACKET_SIZE_EMPTY) {
-			ctx->context_stats_._nraw_send[PACKET_SIZE_EMPTY_BUCKET]++;
+			context_stats_._nraw_send[PACKET_SIZE_EMPTY_BUCKET]++;
 		} else if (length <= PACKET_SIZE_SMALL) {
-			ctx->context_stats_._nraw_send[PACKET_SIZE_SMALL_BUCKET]++;
+			context_stats_._nraw_send[PACKET_SIZE_SMALL_BUCKET]++;
 		} else
-			ctx->context_stats_._nraw_send[PACKET_SIZE_MID_BUCKET]++;
+			context_stats_._nraw_send[PACKET_SIZE_MID_BUCKET]++;
 	} else {
 		// 尺寸 ≥ MID 区间：细分为 BIG / HUGE 两个桶
 		if (length <= PACKET_SIZE_BIG) {
-			ctx->context_stats_._nraw_send[PACKET_SIZE_BIG_BUCKET]++;
+			context_stats_._nraw_send[PACKET_SIZE_BIG_BUCKET]++;
 		} else
-			ctx->context_stats_._nraw_send[PACKET_SIZE_HUGE_BUCKET]++;
+			context_stats_._nraw_send[PACKET_SIZE_HUGE_BUCKET]++;
 	}
 }
 
@@ -200,15 +198,15 @@ static void utp_register_sent_packet(utp_context *ctx, size_t length)
 //   2. 记录本次发送的长度到 raw 统计。
 //   3. 调用 sendto 回调完成实际发送。
 // -----------------------------------------------------------------------------
-void send_to_addr(utp_context *ctx, const byte *p, size_t len, const utp::Address &addr, int flags = 0)
+void UtpContext::send_to_addr_impl(const byte *p, size_t len, const utp::Address &addr, int flags)
 {
 	socklen_t tolen;
 	// 取出平台原生 sockaddr 表示
 	SOCKADDR_STORAGE to = addr.get_sockaddr_storage(&tolen);
 	// 计入发送统计
-	utp_register_sent_packet(ctx, len);
+	register_sent_packet(len);
 	// 通过注册的回调执行真正的 sendto
-	utp_call_sendto(ctx, NULL, p, len, (const struct sockaddr *)&to, tolen, flags);
+	utp_call_sendto(this, NULL, p, len, (const struct sockaddr *)&to, tolen, flags);
 }
 
 // -----------------------------------------------------------------------------
@@ -231,12 +229,12 @@ void send_to_addr(utp_context *ctx, const byte *p, size_t len, const utp::Addres
 // -----------------------------------------------------------------------------
 void UtpSocket::schedule_ack()
 {
-	if (ida == -1){
+	if (ida_ == -1){
 		#if UTP_DEBUG_LOGGING
 		log(UTP_LOG_DEBUG, "schedule_ack");
 		#endif
 		// 当前未在列表中：加入列表尾部，并记录其下标到 ida
-		ctx->ack_sockets_.push_back(this); ida = ctx->ack_sockets_.size() - 1;
+		ctx->ack_sockets_.push_back(this); ida_ = ctx->ack_sockets_.size() - 1;
 	} else {
 		#if UTP_DEBUG_LOGGING
 		log(UTP_LOG_DEBUG, "schedule_ack: already in list");
@@ -313,9 +311,9 @@ void UtpSocket::send_data(byte* b, size_t length, BandwidthType type, uint32 fla
 		seq_nr_, ack_nr_);
 #endif
 	// 通过回调真正发送 UDP 报文
-	send_to_addr(ctx, b, length, addr, flags);
+	ctx->send_to_addr_impl(b, length, addr, flags);
 	// 数据包已发出，移除自己可能存在的延迟 ACK 调度
-	remove_socket_from_ack_list(this);
+	remove_from_ack_list();
 }
 
 // -----------------------------------------------------------------------------
@@ -364,7 +362,7 @@ void UtpSocket::send_ack(bool synack)
 	len = sizeof(PacketFormatV1);
 
 	// 存在乱序包且未完成 FIN：构造选择性 ACK（EACK）扩展
-	if (reorder_count_ != 0 && !got_fin_reached_) {
+	if (reorder_count_ != 0 && !recv_.got_fin_reached_) {
 		// SYN-ACK 不应携带 EACK
 		assert(!synack);
 		pfa.pf.ext = 1;          // 启用扩展
@@ -406,7 +404,7 @@ void UtpSocket::send_ack(bool synack)
 	// 发送 ACK（ack_overhead 类别计入统计）
 	send_data((byte*)&pfa, len, ack_overhead);
 	// 清理延迟 ACK 调度
-	remove_socket_from_ack_list(this);
+	remove_from_ack_list();
 }
 
 // -----------------------------------------------------------------------------
@@ -471,7 +469,7 @@ void UtpSocket::send_rst(utp_context *ctx,
 	len = sizeof(PacketFormatV1);
 
 	// 直接经 send_to_addr 发出，不经过 send_data（避免修改 last_sent_packet_ 等状态）
-	send_to_addr(ctx, (const byte*)&pf1, len, addr);
+	ctx->send_to_addr_impl((const byte*)&pf1, len, addr);
 }
 
 // -----------------------------------------------------------------------------
@@ -817,7 +815,7 @@ void UtpSocket::check_timeouts()
 				return;
 			}
 			if (cc_.retransmit_count() >= 4 || (state_ == CS_SYN_SENT && cc_.retransmit_count() >= 2)) {
-				if (close_requested_)
+				if (send_.close_requested_)
 					state_ = CS_DESTROY;
 				else
 					state_ = CS_RESET;
@@ -846,7 +844,7 @@ void UtpSocket::check_timeouts()
 					, seq_nr_ - cur_window_packets_, cc_.retransmit_timeout()
 					, (uint)cc_.max_window(), int(cur_window_packets_));
 
-				fast_timeout_ = true;
+				timing_.fast_timeout_ = true;
 				timeout_seq_nr_ = seq_nr_;
 
 				OutgoingPacket *pkt = (OutgoingPacket*)outbuf_.get(seq_nr_ - cur_window_packets_);
@@ -863,7 +861,7 @@ void UtpSocket::check_timeouts()
 			#endif
 			utp_call_on_state_change(this->ctx, this, UTP_STATE_WRITABLE);
 		}
-		if (state_ >= CS_CONNECTED && !fin_sent) {
+		if (state_ >= CS_CONNECTED && !send_.fin_sent) {
 			if ((int)(ctx->current_ms_ - last_sent_packet_) >= KEEPALIVE_INTERVAL) {
 				send_keep_alive();
 			}
@@ -1154,39 +1152,10 @@ size_t UtpSocket::get_packet_size() const
 //   6. DEBUG 模式下清零统计结构体。
 // -----------------------------------------------------------------------------
 UtpSocket::UtpSocket(utp_context* _ctx)
-	: addr()
-	, ctx(_ctx)
-	, ida(-1)
-	, reorder_count_(0)
-	, duplicate_ack_(0)
-	, cur_window_packets_(0)
-	, opt_sndbuf_(_ctx->opt_sndbuf_)
-	, opt_rcvbuf_(_ctx->opt_rcvbuf_)
-	, target_delay_(_ctx->target_delay_)
-	, got_fin(false)
-	, got_fin_reached_(false)
-	, fin_sent(false)
-	, fin_sent_acked_(false)
-	, read_shutdown_(false)
-	, close_requested_(false)
-	, fast_timeout_(false)
-	, max_window_user_(255 * PACKET_SIZE)
-	, state_(CS_UNINITIALIZED)
-	, eof_pkt_(0)
-	, ack_nr_(0)
-	, seq_nr_(1)
-	, timeout_seq_nr_(0)
-	, fast_resend_seq_nr_(1)
-	, reply_micro_(0)
-	, last_got_packet_(0)
-	, last_sent_packet_(0)
-	, last_measured_delay_(0)
-	, userdata_(NULL)
-	, conn_seed_(0)
-	, conn_id_recv_(0)
-	, conn_id_send_(0)
-	, last_rcv_win_(0)
-	, extensions_()
+	: conn_{.ctx = _ctx, .target_delay = _ctx->target_delay_}
+	, recv_{.opt_rcvbuf = _ctx->opt_rcvbuf_}
+	, send_{.opt_sndbuf = _ctx->opt_sndbuf_, .max_window_user = 255 * PACKET_SIZE}
+	, ida_(-1)
 	, mtu_(this)
 	, cc_()
 {
@@ -1225,7 +1194,7 @@ UtpSocket::~UtpSocket()
 	auto erased = ctx->sockets_.erase(UtpSocketKey(addr, conn_id_recv_));
 	assert(erased == 1);
 
-	remove_socket_from_ack_list(this);
+	remove_from_ack_list();
 
 	for (size_t i = 0; i < inbuf_.buf_size(); i++) {
 		delete (InboundPacket*)inbuf_.element(i);

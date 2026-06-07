@@ -137,6 +137,16 @@ public:
 	void log_unchecked(utp_socket *socket, char const *fmt, ...);
 	bool would_log(int level);
 
+	void register_sent_packet(size_t length);
+	void send_to_addr_impl(const byte *p, size_t len, const utp::Address &addr, int flags = 0);
+	int process_udp(const byte *buffer, size_t len, const struct sockaddr *to, socklen_t tolen);
+	int process_icmp_fragmentation(const byte* buffer, size_t len, const struct sockaddr *to, socklen_t tolen, uint16 next_hop_mtu);
+	int process_icmp_error(const byte* buffer, size_t len, const struct sockaddr *to, socklen_t tolen);
+	void issue_deferred_acks();
+	void check_timeouts();
+
+	UtpSocket* parse_icmp_payload(const byte *buffer, size_t len, const struct sockaddr *to, socklen_t tolen);
+
 	bool log_normal_:1;	// log normal events?
 	bool log_mtu_:1;		// log MTU related events?
 	bool log_debug_:1;	// log debugging events? (Must also compile with UTP_DEBUG_LOGGING defined)
