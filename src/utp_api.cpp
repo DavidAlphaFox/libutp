@@ -47,8 +47,15 @@ using std::min;
 // CFunctionCallbackAdapter: 将旧的 C 函数指针回调适配到 UtpCallbacks 虚接口。
 // 由 utp_set_callback() 内部使用，无需用户直接操作。
 class CFunctionCallbackAdapter : public UtpCallbacks {
+	// 函数指针数组，按 UTP_* 回调 ID 索引。
+	// 值为 nullptr 表示该回调未通过 utp_set_callback() 注册，应回退到 UtpCallbacks 虚基类默认实现。
 	utp_callback_t* handlers_[UTP_ARRAY_SIZE] = {};
 
+	// 构造一个 utp_callback_arguments 结构体并预填 callback_type 和 socket 字段。
+	// 各 override 方法再按需填入其余的 args 字段。
+	// 参数 type - 回调类型，对应 UTP_ON_FIREWALL/UTP_GET_MILLISECONDS 等枚举值
+	// 参数 sock - 关联的 utp_socket 指针，若回调不涉及具体 socket 可传 nullptr
+	// 返回: 已填充 callback_type 和 socket 的参数结构体
 	static utp_callback_arguments make_args(int type, utp_socket* sock) {
 		utp_callback_arguments args{};
 		args.callback_type = type;
@@ -57,9 +64,19 @@ class CFunctionCallbackAdapter : public UtpCallbacks {
 	}
 
 public:
+	// 注册（或覆盖）指定 ID 的 C 风格回调函数。
+	// 由 utp_set_callback() 内部调用，外部用户通常无需直接调用。
+	// 参数 id - 回调 ID（UTP_SENDTO、UTP_GET_MILLISECONDS 等）
+	// 参数 fn - 用户提供的 C 风格回调函数指针，传 nullptr 表示清除
 	void set_handler(int id, utp_callback_t* fn) { handlers_[id] = fn; }
 
 	// ── ACTION ──
+	// ACTION 类型回调：将数据包通过底层 UDP socket 发送出去
+	// 参数 data - 待发送的数据（含 uTP 协议头）
+	// 参数 len - 数据长度
+	// 参数 address - 目标对端地址
+	// 参数 address_len - 目标地址长度
+	// 参数 flags - 平台特定的发送标志位
 	void sendto(UtpSocket*, const uint8_t* data, size_t len,
 	            const sockaddr* address, socklen_t address_len, uint32_t flags) override {
 		if (!handlers_[UTP_SENDTO]) return;
@@ -70,33 +87,47 @@ public:
 	}
 
 	// ── QUERY ──
+	// QUERY 类型回调：返回当前单调递增的毫秒时间戳。
+	// 如果用户未提供 UTP_GET_MILLISECONDS 回调，则回退到基类默认实现（平台相关的单调时钟）。
 	uint64 get_milliseconds(UtpSocket* s) override {
 		if (!handlers_[UTP_GET_MILLISECONDS]) return UtpCallbacks::get_milliseconds(s);
 		auto args = make_args(UTP_GET_MILLISECONDS, s);
 		return handlers_[UTP_GET_MILLISECONDS](&args);
 	}
+	// QUERY 类型回调：返回当前单调递增的微秒时间戳。
+	// 精度高于 get_milliseconds，用于 LEDBAT 拥塞控制等需要更细粒度采样的场景。
 	uint64 get_microseconds(UtpSocket* s) override {
 		if (!handlers_[UTP_GET_MICROSECONDS]) return UtpCallbacks::get_microseconds(s);
 		auto args = make_args(UTP_GET_MICROSECONDS, s);
 		return handlers_[UTP_GET_MICROSECONDS](&args);
 	}
+	// QUERY 类型回调：返回到达指定对端地址的 UDP 路径 MTU。
+	// 用于 uTP 动态 MTU 探测时的上限参考值。
+	// 参数 a - 对端地址
+	// 参数 l - 对端地址长度
+	// 返回: 路径 MTU（字节）
 	uint16 get_udp_mtu(UtpSocket* s, const sockaddr* a, socklen_t l) override {
 		if (!handlers_[UTP_GET_UDP_MTU]) return UtpCallbacks::get_udp_mtu(s, a, l);
 		auto args = make_args(UTP_GET_UDP_MTU, s);
 		args.address = a; args.address_len = l;
 		return (uint16)handlers_[UTP_GET_UDP_MTU](&args);
 	}
+	// QUERY 类型回调：返回 UDP 层（IP+UDP 头）的固定开销字节数。
+	// 用于从路径 MTU 推导出 uTP 实际可用载荷大小。
 	uint16 get_udp_overhead(UtpSocket* s, const sockaddr* a, socklen_t l) override {
 		if (!handlers_[UTP_GET_UDP_OVERHEAD]) return UtpCallbacks::get_udp_overhead(s, a, l);
 		auto args = make_args(UTP_GET_UDP_OVERHEAD, s);
 		args.address = a; args.address_len = l;
 		return (uint16)handlers_[UTP_GET_UDP_OVERHEAD](&args);
 	}
+	// QUERY 类型回调：返回 32 位随机数。用于生成连接种子和初始序列号。
 	uint32 get_random(UtpSocket* s) override {
 		if (!handlers_[UTP_GET_RANDOM]) return UtpCallbacks::get_random(s);
 		auto args = make_args(UTP_GET_RANDOM, s);
 		return (uint32)handlers_[UTP_GET_RANDOM](&args);
 	}
+	// QUERY 类型回调：返回用户已读取但尚未提交的数据量。
+	// 用于在拥塞控制中正确估算接收窗口大小。
 	size_t get_read_buffer_size(UtpSocket* s) override {
 		if (!handlers_[UTP_GET_READ_BUFFER_SIZE]) return UtpCallbacks::get_read_buffer_size(s);
 		auto args = make_args(UTP_GET_READ_BUFFER_SIZE, s);
@@ -104,53 +135,82 @@ public:
 	}
 
 	// ── EVENT ──
+	// EVENT 类型回调：判断指定对端地址是否在防火墙后。
+	// 返回: 非 0 表示无法到达（应丢弃该地址的入站数据包）。
 	int on_firewall(const sockaddr* a, socklen_t l) override {
 		if (!handlers_[UTP_ON_FIREWALL]) return UtpCallbacks::on_firewall(a, l);
 		auto args = make_args(UTP_ON_FIREWALL, nullptr);
 		args.address = a; args.address_len = l;
 		return (int)handlers_[UTP_ON_FIREWALL](&args);
 	}
+	// EVENT 类型回调：通知用户有新的入站连接已被接受。
+	// 参数 s - 服务端新创建的 socket
+	// 参数 a - 对端地址
+	// 参数 l - 对端地址长度
 	void on_accept(UtpSocket* s, const sockaddr* a, socklen_t l) override {
 		if (!handlers_[UTP_ON_ACCEPT]) return;
 		auto args = make_args(UTP_ON_ACCEPT, s);
 		args.address = a; args.address_len = l;
 		handlers_[UTP_ON_ACCEPT](&args);
 	}
+	// EVENT 类型回调：通知用户主动连接（SYN）已建立。
+	// 参数 s - 已连接的 socket
 	void on_connect(UtpSocket* s) override {
 		if (!handlers_[UTP_ON_CONNECT]) return;
 		auto args = make_args(UTP_ON_CONNECT, s);
 		handlers_[UTP_ON_CONNECT](&args);
 	}
+	// EVENT 类型回调：通知用户 socket 发生错误。
+	// 参数 s - 出错的 socket
+	// 参数 error_code - 错误码（UTP_ECONNREFUSED/UTP_ECONNRESET/UTP_ETIMEDOUT）
 	void on_error(UtpSocket* s, int error_code) override {
 		if (!handlers_[UTP_ON_ERROR]) return;
 		auto args = make_args(UTP_ON_ERROR, s);
 		args.error_code = error_code;
 		handlers_[UTP_ON_ERROR](&args);
 	}
+	// EVENT 类型回调：通知用户有已就绪的应用层数据可读取。
+	// 参数 s - 有数据可读的 socket
+	// 参数 data - 数据缓冲区
+	// 参数 len - 数据长度
 	void on_read(UtpSocket* s, const uint8_t* data, size_t len) override {
 		if (!handlers_[UTP_ON_READ]) return;
 		auto args = make_args(UTP_ON_READ, s);
 		args.buf = data; args.len = len;
 		handlers_[UTP_ON_READ](&args);
 	}
+	// EVENT 类型回调：通知用户 socket 连接状态发生变化。
+	// 参数 s - 状态发生变化的 socket
+	// 参数 state - 新状态（UTP_STATE_CONNECT/UTP_STATE_WRITABLE/UTP_STATE_EOF/UTP_STATE_DESTROYING）
 	void on_state_change(UtpSocket* s, int state) override {
 		if (!handlers_[UTP_ON_STATE_CHANGE]) return;
 		auto args = make_args(UTP_ON_STATE_CHANGE, s);
 		args.state = state;
 		handlers_[UTP_ON_STATE_CHANGE](&args);
 	}
+	// EVENT 类型回调：通知用户记录一次测量的端到端延迟样本（毫秒）。
+	// 参数 s - 对应的 socket
+	// 参数 sample_ms - 单次延迟采样值
 	void on_delay_sample(UtpSocket* s, int sample_ms) override {
 		if (!handlers_[UTP_ON_DELAY_SAMPLE]) return;
 		auto args = make_args(UTP_ON_DELAY_SAMPLE, s);
 		args.sample_ms = sample_ms;
 		handlers_[UTP_ON_DELAY_SAMPLE](&args);
 	}
+	// EVENT 类型回调：通知用户底层带宽开销统计信息。
+	// 参数 s - 对应的 socket
+	// 参数 send - true 表示发送方向，false 表示接收方向
+	// 参数 len - 该次事件涉及的字节数
+	// 参数 type - 带宽类型（BandwidthType 枚举）
 	void on_overhead_statistics(UtpSocket* s, bool send, size_t len, int type) override {
 		if (!handlers_[UTP_ON_OVERHEAD_STATISTICS]) return;
 		auto args = make_args(UTP_ON_OVERHEAD_STATISTICS, s);
 		args.send = send ? 1 : 0; args.len = len; args.type = type;
 		handlers_[UTP_ON_OVERHEAD_STATISTICS](&args);
 	}
+	// EVENT 类型回调：将内部日志消息转发给用户。
+	// 参数 s - 关联的 socket（可能为 nullptr）
+	// 参数 message - UTF-8/ASCII 格式的日志消息
 	void log(UtpSocket* s, const char* message) override {
 		if (!handlers_[UTP_LOG]) return;
 		auto args = make_args(UTP_LOG, s);
@@ -197,7 +257,14 @@ const char *utp_state_names[] = {
 	"UTP_STATE_DESTROYING",
 };
 
-// utp_context 构造函数，初始化上下文
+// -----------------------------------------------------------------------------
+// 函数：UtpContext::UtpContext
+// 功能：构造函数，初始化 uTP 上下文。
+//
+// 参数：无
+//
+// 返回值：无
+// -----------------------------------------------------------------------------
 UtpContext::UtpContext()
 	: userdata_(NULL)
 	, callbacks_(std::make_unique<UtpCallbacks>())
@@ -213,7 +280,14 @@ UtpContext::UtpContext()
 	last_check_ = 0;
 }
 
-// utp_context 析构函数，清理资源
+// -----------------------------------------------------------------------------
+// 函数：UtpContext::~UtpContext
+// 功能：析构函数，清理上下文及其管理的所有 socket 资源。
+//
+// 参数：无
+//
+// 返回值：无
+// -----------------------------------------------------------------------------
 UtpContext::~UtpContext() {
 	std::vector<UtpSocket*> socks;
 	socks.reserve(sockets_.size());
@@ -298,6 +372,16 @@ ssize_t utp_write(utp_socket *socket, void *buf, size_t len) {
 
 // =============================================================================
 
+// 初始化一个 uTP socket 的内部状态（状态机、连接 ID、计时器、拥塞控制、MTU 等）。
+// 这是所有 uTP socket 公共入口（utp_connect、utp_accept、utp_create_socket）的共同底层。
+// 参数 conn - 待初始化的 socket 指针
+// 参数 addr - 对端地址
+// 参数 addrlen - 对端地址长度
+// 参数 need_seed_gen - 是否需要重新生成 conn_seed_ 和 conn_id_*
+//                     （主动 connect 时为 true，服务端接受时为 false）
+// 参数 conn_seed_ - 连接种子；need_seed_gen 为 true 时被本函数覆写
+// 参数 conn_id_recv_ - 接收方向连接 ID；need_seed_gen 为 true 时被本函数覆写
+// 参数 conn_id_send_ - 发送方向连接 ID；need_seed_gen 为 true 时被本函数覆写
 void utp_initialize_socket(	utp_socket *conn,
 							const struct sockaddr *addr,
 							socklen_t addrlen,
@@ -342,6 +426,11 @@ void utp_initialize_socket(	utp_socket *conn,
 	#endif
 }
 
+// 创建一个未初始化的 uTP socket。
+// 创建后 socket 处于 CS_UNINITIALIZED 状态，必须通过 utp_connect 发起主动连接，
+// 或由协议栈在接收到 SYN 时内部调用 utp_initialize_socket 转为 CS_SYN_RECV。
+// 参数 ctx - 所属的 uTP 上下文
+// 返回: 新创建的 socket 指针；ctx 为 NULL 时返回 NULL
 utp_socket*	utp_create_socket(utp_context *ctx)
 {
 	assert(ctx);
@@ -353,6 +442,12 @@ utp_socket*	utp_create_socket(utp_context *ctx)
 	return conn;
 }
 
+// 设置 uTP 上下文级别的选项。
+// 支持的选项：UTP_LOG_NORMAL/UTP_LOG_MTU/UTP_LOG_DEBUG/UTP_TARGET_DELAY/UTP_SNDBUF/UTP_RCVBUF。
+// 参数 ctx - 上下文指针
+// 参数 opt - 选项名（UTP_* 枚举值）
+// 参数 val - 选项值（非 0/0 用于布尔选项，正整数用于缓冲区/延迟）
+// 返回: 0 表示成功，-1 表示 ctx 为 NULL 或 opt 未知
 int utp_context_set_option(utp_context *ctx, int opt, int val)
 {
 	assert(ctx);
@@ -388,6 +483,11 @@ int utp_context_set_option(utp_context *ctx, int opt, int val)
 	return -1;
 }
 
+// 获取 uTP 上下文级别选项的当前值。
+// 选项集与 utp_context_set_option 相同。
+// 参数 ctx - 上下文指针
+// 参数 opt - 选项名（UTP_* 枚举值）
+// 返回: 选项当前值；ctx 为 NULL 或 opt 未知时返回 -1
 int utp_context_get_option(utp_context *ctx, int opt)
 {
 	assert(ctx);
@@ -405,6 +505,13 @@ int utp_context_get_option(utp_context *ctx, int opt)
 }
 
 
+// 设置单个 uTP socket 级别的选项。
+// 支持的选项：UTP_SNDBUF/UTP_RCVBUF/UTP_TARGET_DELAY。
+// 必须在 socket 处于 CS_CONNECTED 之前调用以避免与并发传输冲突。
+// 参数 conn - socket 指针
+// 参数 opt - 选项名
+// 参数 val - 选项值
+// 返回: 0 表示成功，-1 表示 conn 为 NULL 或 opt 未知
 int utp_setsockopt(UtpSocket* conn, int opt, int val)
 {
 	assert(conn);
@@ -430,6 +537,10 @@ int utp_setsockopt(UtpSocket* conn, int opt, int val)
 	return -1;
 }
 
+// 获取单个 uTP socket 级别选项的当前值。
+// 参数 conn - socket 指针
+// 参数 opt - 选项名（UTP_SNDBUF/UTP_RCVBUF/UTP_TARGET_DELAY）
+// 返回: 选项当前值；conn 为 NULL 或 opt 未知时返回 -1
 int utp_getsockopt(UtpSocket* conn, int opt)
 {
 	assert(conn);
@@ -444,6 +555,13 @@ int utp_getsockopt(UtpSocket* conn, int opt)
 	return -1;
 }
 
+// 主动发起一次 uTP 连接（发送 SYN）。
+// 调用后 socket 状态由 CS_UNINITIALIZED 转为 CS_SYN_SENT，
+// 收到 SYN-ACK 后通过 UTP_STATE_CONNECT 事件回调通知用户。
+// 参数 conn - 由 utp_create_socket() 创建的未连接 socket
+// 参数 to - 对端地址
+// 参数 tolen - 对端地址长度
+// 返回: 0 表示成功发起；-1 表示 conn 为 NULL 或 socket 已处于非初始状态
 int utp_connect(utp_socket *conn, const struct sockaddr *to, socklen_t tolen)
 {
 	assert(conn);
@@ -506,8 +624,18 @@ int utp_connect(utp_socket *conn, const struct sockaddr *to, socklen_t tolen)
 	return 0;
 }
 
-// Write bytes to the UTP socket.  Returns the number of bytes written.
-// 0 indicates the socket is no longer writable, -1 indicates an error
+// -----------------------------------------------------------------------------
+// 函数：utp_writev
+// 功能：使用 scatter/gather I/O 向 uTP 连接写入多段不连续数据。
+//
+// 参数：
+//   conn         - 目标 socket 指针
+//   iovec_input  - iovec 数组，每项包含缓冲区地址和长度
+//   num_iovecs   - iovec 数组长度（上限 UTP_IOV_MAX）
+//
+// 返回值：
+//   成功入队的总字节数；socket 未连接或已发送 FIN 时返回 0；参数错误返回 -1
+// -----------------------------------------------------------------------------
 ssize_t utp_writev(utp_socket *conn, struct utp_iovec *iovec_input, size_t num_iovecs)
 {
 	static utp_iovec iovec[UTP_IOV_MAX];
@@ -588,6 +716,15 @@ ssize_t utp_writev(utp_socket *conn, struct utp_iovec *iovec_input, size_t num_i
 	return sent;
 }
 
+// -----------------------------------------------------------------------------
+// 函数：utp_read_drained
+// 功能：通知库应用已消费完数据，释放接收缓冲区。
+//
+// 参数：
+//   conn - socket 指针
+//
+// 返回值：无
+// -----------------------------------------------------------------------------
 void utp_read_drained(utp_socket *conn)
 {
 	assert(conn);
@@ -608,6 +745,15 @@ void utp_read_drained(utp_socket *conn)
 	}
 }
 
+// -----------------------------------------------------------------------------
+// 函数：utp_issue_deferred_acks
+// 功能：触发延迟 ACK 发送。
+//
+// 参数：
+//   ctx - uTP 上下文指针
+//
+// 返回值：无
+// -----------------------------------------------------------------------------
 void utp_issue_deferred_acks(utp_context *ctx)
 {
 	assert(ctx);
@@ -620,6 +766,15 @@ void utp_issue_deferred_acks(utp_context *ctx)
 	}
 }
 
+// -----------------------------------------------------------------------------
+// 函数：utp_check_timeouts
+// 功能：周期性驱动库的定时器。
+//
+// 参数：
+//   ctx - uTP 上下文指针
+//
+// 返回值：无
+// -----------------------------------------------------------------------------
 void utp_check_timeouts(utp_context *ctx)
 {
 	assert(ctx);
@@ -658,6 +813,18 @@ void utp_check_timeouts(utp_context *ctx)
 	}
 }
 
+// -----------------------------------------------------------------------------
+// 函数：utp_getpeername
+// 功能：获取对端地址。
+//
+// 参数：
+//   conn    - socket 指针
+//   addr    - 输出缓冲区，用于存储对端地址
+//   addrlen - 输入/输出参数，传入 addr 缓冲区大小，返回实际地址长度
+//
+// 返回值：
+//   0 表示成功；-1 表示参数错误或 socket 未初始化
+// -----------------------------------------------------------------------------
 int utp_getpeername(utp_socket *conn, struct sockaddr *addr, socklen_t *addrlen)
 {
 	assert(addr);
@@ -679,6 +846,19 @@ int utp_getpeername(utp_socket *conn, struct sockaddr *addr, socklen_t *addrlen)
 	return 0;
 }
 
+// -----------------------------------------------------------------------------
+// 函数：utp_get_delays
+// 功能：获取延迟测量值。
+//
+// 参数：
+//   conn   - socket 指针
+//   ours   - 输出参数，本端到对端的延迟（毫秒），可为 NULL
+//   theirs - 输出参数，对端到本端的延迟（毫秒），可为 NULL
+//   age    - 输出参数，距离上次测量延迟的时间（毫秒），可为 NULL
+//
+// 返回值：
+//   0 表示成功；-1 表示 socket 未初始化
+// -----------------------------------------------------------------------------
 int utp_get_delays(UtpSocket *conn, uint32 *ours, uint32 *theirs, uint32 *age)
 {
 	assert(conn);
@@ -698,6 +878,15 @@ int utp_get_delays(UtpSocket *conn, uint32 *ours, uint32 *theirs, uint32 *age)
 	return 0;
 }
 
+// -----------------------------------------------------------------------------
+// 函数：utp_close
+// 功能：关闭 socket。
+//
+// 参数：
+//   conn - socket 指针
+//
+// 返回值：无
+// -----------------------------------------------------------------------------
 void utp_close(UtpSocket *conn)
 {
 	assert(conn);
@@ -736,6 +925,16 @@ void utp_close(UtpSocket *conn)
 	#endif
 }
 
+// -----------------------------------------------------------------------------
+// 函数：utp_shutdown
+// 功能：关闭 socket 方向。
+//
+// 参数：
+//   conn - socket 指针
+//   how  - 关闭方向（SHUT_RD 关闭读、SHUT_WR 关闭写）
+//
+// 返回值：无
+// -----------------------------------------------------------------------------
 void utp_shutdown(UtpSocket *conn, int how)
 {
 	assert(conn);
@@ -768,22 +967,65 @@ void utp_shutdown(UtpSocket *conn, int how)
 	}
 }
 
+// -----------------------------------------------------------------------------
+// 函数：utp_get_context
+// 功能：获取 socket 所属 context。
+//
+// 参数：
+//   socket - socket 指针
+//
+// 返回值：
+//   所属上下文指针；socket 为 NULL 时返回 NULL
+// -----------------------------------------------------------------------------
 utp_context* utp_get_context(utp_socket *socket) {
 	assert(socket);
 	return socket ? socket->ctx : NULL;
 }
 
+// -----------------------------------------------------------------------------
+// 函数：utp_set_userdata
+// 功能：设置用户数据。
+//
+// 参数：
+//   socket     - socket 指针
+//   userdata_  - 用户数据指针
+//
+// 返回值：
+//   设置后的用户数据指针；socket 为 NULL 时返回 NULL
+// -----------------------------------------------------------------------------
 void* utp_set_userdata(utp_socket *socket, void *userdata_) {
 	assert(socket);
 	if (socket) socket->userdata_ = userdata_;
 	return socket ? socket->userdata_ : NULL;
 }
 
+// -----------------------------------------------------------------------------
+// 函数：utp_get_userdata
+// 功能：获取用户数据。
+//
+// 参数：
+//   socket - socket 指针
+//
+// 返回值：
+//   用户数据指针；socket 为 NULL 时返回 NULL
+// -----------------------------------------------------------------------------
 void* utp_get_userdata(utp_socket *socket) {
 	assert(socket);
 	return socket ? socket->userdata_ : NULL;
 }
 
+// -----------------------------------------------------------------------------
+// 函数：UtpContext::log
+// 功能：日志记录。根据日志级别决定是否输出日志。
+//
+// 参数：
+//   level  - 日志级别（UTP_LOG_NORMAL/UTP_LOG_MTU/UTP_LOG_DEBUG）
+//   socket - 关联的 socket 指针（可能为 nullptr）
+//   fmt    - printf 格式字符串
+//   ...    - 可变参数
+//
+// 返回值：无
+// -----------------------------------------------------------------------------
 void UtpContext::log(int level, utp_socket *socket, char const *fmt, ...)
 {
 	if (!would_log(level)) {
@@ -796,6 +1038,17 @@ void UtpContext::log(int level, utp_socket *socket, char const *fmt, ...)
 	va_end(va);
 }
 
+// -----------------------------------------------------------------------------
+// 函数：UtpContext::log_unchecked
+// 功能：无条件日志记录。不检查日志级别，直接格式化并输出日志。
+//
+// 参数：
+//   socket - 关联的 socket 指针（可能为 nullptr）
+//   fmt    - printf 格式字符串
+//   ...    - 可变参数
+//
+// 返回值：无
+// -----------------------------------------------------------------------------
 void UtpContext::log_unchecked(utp_socket *socket, char const *fmt, ...)
 {
 	va_list va;
@@ -809,6 +1062,16 @@ void UtpContext::log_unchecked(utp_socket *socket, char const *fmt, ...)
 	utp_call_log(this, socket, (const byte *)buf);
 }
 
+// -----------------------------------------------------------------------------
+// 函数：UtpContext::would_log
+// 功能：检查日志级别。判断指定级别的日志是否应被输出。
+//
+// 参数：
+//   level - 日志级别（UTP_LOG_NORMAL/UTP_LOG_MTU/UTP_LOG_DEBUG）
+//
+// 返回值：
+//   true 表示该级别日志已启用；false 表示未启用
+// -----------------------------------------------------------------------------
 inline bool UtpContext::would_log(int level)
 {
 	if (level == UTP_LOG_NORMAL) return log_normal_;
@@ -817,6 +1080,16 @@ inline bool UtpContext::would_log(int level)
 	return true;
 }
 
+// -----------------------------------------------------------------------------
+// 函数：utp_get_stats
+// 功能：获取 socket 统计信息。
+//
+// 参数：
+//   socket - socket 指针
+//
+// 返回值：
+//   统计信息结构体指针；非 _DEBUG 编译时返回 NULL
+// -----------------------------------------------------------------------------
 utp_socket_stats* utp_get_stats(utp_socket *socket)
 {
 	#ifdef _DEBUG
