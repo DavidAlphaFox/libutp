@@ -70,6 +70,18 @@ struct InboundPacket {
 	std::vector<uint8_t> data;     // 数据包内容
 };
 
+struct ParsedPacket {
+	const byte* payload = nullptr;   // data start (after header + extensions)
+	const byte* end = nullptr;       // packet end
+	const byte* selack = nullptr;    // SACK extension pointer (NULL if none)
+	uint16 seq_nr = 0;              // packet sequence number
+	uint16 ack_nr = 0;              // packet ack number
+	uint8  type = 0;                // packet type (ST_DATA, ST_STATE, etc.)
+	uint32 timestamp = 0;           // sender timestamp (tv_usec)
+	uint32 reply_micro = 0;         // our delay as measured by remote
+	uint16 windowsize = 0;          // advertised window
+};
+
 // =============================================================================
 // 数据分组 struct：将 UtpSocket 的 ~40 个字段按职责归入 4 个纯数据分组。
 // 这些 struct 没有行为方法——协议逻辑天然跨 send/receive 边界，
@@ -298,4 +310,9 @@ public:
 	void shutdown(int how);
 	// 通知接收缓冲区已消费，可能触发窗口更新
 	void read_drained();
+
+	bool parse_packet(const byte* packet, size_t len, ParsedPacket& pp);
+	size_t process_acks(const ParsedPacket& pp, int acks, uint64 time);
+	void advance_send_window(const ParsedPacket& pp, int acks);
+	size_t deliver_data(const ParsedPacket& pp, uint seqnr);
 };

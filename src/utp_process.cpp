@@ -142,119 +142,57 @@ size_t UtpSocket::process_incoming(const byte *packet, size_t len, bool syn)
 	register_recv_packet(len);
 	ctx->current_ms_ = utp_call_get_milliseconds(ctx, this);
 
-	const PacketFormatV1 *pf1 = (PacketFormatV1*)packet;
-	const byte *packet_end = packet + len;
-
-	uint16 pk_seq_nr_ = pf1->seq_nr;
-	uint16 pk_ack_nr_ = pf1->ack_nr;
-	uint8 pk_flags   = pf1->type();
-
-	if (pk_flags >= ST_NUM_STATES) return 0;
+	ParsedPacket pp;
+	if (!parse_packet(packet, len, pp))
+		return 0;
 
 	#if UTP_DEBUG_LOGGING
 	log(UTP_LOG_DEBUG, "Got %s. seq_nr_:%u ack_nr_:%u state:%s timestamp:" I64u " reply_micro_:%u"
-		, flagnames[pk_flags], pk_seq_nr_, pk_ack_nr_, statenames[state_]
-		, uint64(pf1->tv_usec), (uint32)(pf1->reply_micro));
+		, flagnames[pp.type], pp.seq_nr, pp.ack_nr, statenames[state_]
+		, uint64(pp.timestamp), pp.reply_micro);
 	#endif
 
 	uint64 time = utp_call_get_microseconds(ctx, this);
 	const uint16 curr_window = max<uint16>(cur_window_packets_ + ACK_NR_ALLOWED_WINDOW, ACK_NR_ALLOWED_WINDOW);
 
-	if ((pk_flags != ST_SYN || state_ != CS_SYN_RECV) &&
-		(wrapping_compare_less(seq_nr_ - 1, pk_ack_nr_, ACK_NR_MASK)
-		|| wrapping_compare_less(pk_ack_nr_, seq_nr_ - 1 - curr_window, ACK_NR_MASK))) {
-#if UTP_DEBUG_LOGGING
-	log(UTP_LOG_DEBUG, "Invalid ack_nr_: %u. our seq_nr_: %u last unacked: %u"
-	, pk_ack_nr_, seq_nr_, (seq_nr_ - cur_window_packets_) & ACK_NR_MASK);
-#endif
-		return 0;
-	}
-
-	assert(pk_flags != ST_RESET);
-
-	const byte *selack_ptr = NULL;
-
-	const byte *data = (const byte*)pf1 + get_header_size();
-	if (get_header_size() > len) {
-
+	if ((pp.type != ST_SYN || state_ != CS_SYN_RECV) &&
+		(wrapping_compare_less(seq_nr_ - 1, pp.ack_nr, ACK_NR_MASK)
+		|| wrapping_compare_less(pp.ack_nr, seq_nr_ - 1 - curr_window, ACK_NR_MASK))) {
 		#if UTP_DEBUG_LOGGING
-		log(UTP_LOG_DEBUG, "Invalid packet size (less than header size)");
+		log(UTP_LOG_DEBUG, "Invalid ack_nr_: %u. our seq_nr_: %u last unacked: %u"
+			, pp.ack_nr, seq_nr_, (seq_nr_ - cur_window_packets_) & ACK_NR_MASK);
 		#endif
-
 		return 0;
 	}
-	uint extension = pf1->ext;
-	if (extension != 0) {
-		do {
-			data += 2;
 
-			if ((int)(packet_end - data) < 0 || (int)(packet_end - data) < data[-1]) {
-
-				#if UTP_DEBUG_LOGGING
-				log(UTP_LOG_DEBUG, "Invalid len of extensions_");
-				#endif
-
-				return 0;
-			}
-
-			switch(extension) {
-			case 1:
-				selack_ptr = data;
-				break;
-			case 2:
-				if (data[-1] != 8) {
-
-					#if UTP_DEBUG_LOGGING
-					log(UTP_LOG_DEBUG, "Invalid len of extension bits header");
-					#endif
-
-					return 0;
-				}
-				memcpy(extensions_, data, 8);
-
-				#if UTP_DEBUG_LOGGING
-				log(UTP_LOG_DEBUG, "got extension bits:%02x%02x%02x%02x%02x%02x%02x%02x",
-					extensions_[0], extensions_[1], extensions_[2], extensions_[3],
-					extensions_[4], extensions_[5], extensions_[6], extensions_[7]);
-				#endif
-			}
-			extension = data[-2];
-			data += data[-1];
-		} while (extension);
-	}
+	assert(pp.type != ST_RESET);
 
 	if (state_ == CS_SYN_SENT) {
-		ack_nr_ = (pk_seq_nr_ - 1) & SEQ_NR_MASK;
+		ack_nr_ = (pp.seq_nr - 1) & SEQ_NR_MASK;
 	}
 	last_got_packet_ = ctx->current_ms_;
-	if (syn) {
-		return 0;
-	}
+	if (syn) return 0;
 
-	const uint seqnr = (pk_seq_nr_ - ack_nr_ - 1) & SEQ_NR_MASK;
+	const uint seqnr = (pp.seq_nr - ack_nr_ - 1) & SEQ_NR_MASK;
 	if (seqnr >= REORDER_BUFFER_MAX_SIZE) {
-		if (seqnr >= (SEQ_NR_MASK + 1) - REORDER_BUFFER_MAX_SIZE && pk_flags != ST_STATE) {
+		if (seqnr >= (SEQ_NR_MASK + 1) - REORDER_BUFFER_MAX_SIZE && pp.type != ST_STATE) {
 			schedule_ack();
 		}
-
 		#if UTP_DEBUG_LOGGING
-		log(UTP_LOG_DEBUG, "    Got old Packet/Ack (%u/%u)=%u"
-			, pk_seq_nr_, ack_nr_, seqnr);
+		log(UTP_LOG_DEBUG, "    Got old Packet/Ack (%u/%u)=%u", pp.seq_nr, ack_nr_, seqnr);
 		#endif
 		return 0;
 	}
 
-	int acks = (pk_ack_nr_ - (seq_nr_ - 1 - cur_window_packets_)) & ACK_NR_MASK;
-
+	int acks = (pp.ack_nr - (seq_nr_ - 1 - cur_window_packets_)) & ACK_NR_MASK;
 	if (acks > cur_window_packets_) acks = 0;
 
 	if (cur_window_packets_ > 0) {
-		if (pk_ack_nr_ == ((seq_nr_ - cur_window_packets_ - 1) & ACK_NR_MASK)
-			&& cur_window_packets_ > 0
-			&& pk_flags == ST_STATE) {
+		if (pp.ack_nr == ((seq_nr_ - cur_window_packets_ - 1) & ACK_NR_MASK)
+			&& cur_window_packets_ > 0 && pp.type == ST_STATE) {
 			++duplicate_ack_;
 			if (duplicate_ack_ == DUPLICATE_ACKS_BEFORE_RESEND && mtu_.probe_seq()) {
-				if (pk_ack_nr_ == ((mtu_.probe_seq() - 1) & ACK_NR_MASK)) {
+				if (pp.ack_nr == ((mtu_.probe_seq() - 1) & ACK_NR_MASK)) {
 					mtu_.handle_probe_loss(ctx->current_ms_);
 					log(UTP_LOG_MTU, "MTU [DUPACK] floor:%d ceiling:%d current:%d"
 						, mtu_.floor(), mtu_.ceiling(), mtu_.last());
@@ -265,13 +203,102 @@ size_t UtpSocket::process_incoming(const byte *packet, size_t len, bool syn)
 		} else {
 			duplicate_ack_ = 0;
 		}
-
-		// TODO: if duplicate_ack_ == DUPLICATE_ACK_BEFORE_RESEND
-		// and fast_resend_seq_nr_ <= ack_nr_ + 1
-		//    resend ack_nr_ + 1
-		// also call maybe_decay_win()
 	}
 
+	[[maybe_unused]] size_t acked_bytes = process_acks(pp, acks, time);
+	advance_send_window(pp, acks);
+
+	if (pp.selack != NULL) {
+		selective_ack(pp.ack_nr + 2, pp.selack, pp.selack[-1]);
+	}
+
+	assert(cur_window_packets_ == 0 || outbuf_.get(seq_nr_ - cur_window_packets_));
+
+	#if UTP_DEBUG_LOGGING
+	log(UTP_LOG_DEBUG, "acks:%d acked_bytes:%u seq_nr_:%u cur_window_:%u cur_window_packets_:%u ",
+		acks, (uint)acked_bytes, seq_nr_, (uint)cc_.cur_window(), cur_window_packets_);
+	#endif
+
+	if (state_ == CS_CONNECTED_FULL && !is_full()) {
+		state_ = CS_CONNECTED;
+		#if UTP_DEBUG_LOGGING
+		log(UTP_LOG_DEBUG, "Socket writable. max_window_:%u cur_window_:%u packet_size:%u",
+			(uint)cc_.max_window(), (uint)cc_.cur_window(), (uint)get_packet_size());
+		#endif
+		utp_call_on_state_change(ctx, this, UTP_STATE_WRITABLE);
+	}
+	if (pp.type == ST_STATE) return 0;
+	if (state_ != CS_CONNECTED && state_ != CS_CONNECTED_FULL) return 0;
+
+	return deliver_data(pp, seqnr);
+}
+
+bool UtpSocket::parse_packet(const byte* packet, size_t len, ParsedPacket& pp)
+{
+	const PacketFormatV1 *pf1 = (PacketFormatV1*)packet;
+	const byte *packet_end = packet + len;
+
+	pp.seq_nr = pf1->seq_nr;
+	pp.ack_nr = pf1->ack_nr;
+	pp.type   = pf1->type();
+
+	if (pp.type >= ST_NUM_STATES) return false;
+
+	pp.timestamp = pf1->tv_usec;
+	pp.reply_micro = pf1->reply_micro;
+	pp.windowsize = pf1->windowsize;
+	pp.selack = NULL;
+
+	pp.payload = (const byte*)pf1 + get_header_size();
+	if (get_header_size() > len) {
+		#if UTP_DEBUG_LOGGING
+		log(UTP_LOG_DEBUG, "Invalid packet size (less than header size)");
+		#endif
+		return false;
+	}
+	pp.end = packet_end;
+
+	uint extension = pf1->ext;
+	if (extension != 0) {
+		do {
+			pp.payload += 2;
+
+			if ((int)(packet_end - pp.payload) < 0 || (int)(packet_end - pp.payload) < pp.payload[-1]) {
+				#if UTP_DEBUG_LOGGING
+				log(UTP_LOG_DEBUG, "Invalid len of extensions_");
+				#endif
+				return false;
+			}
+
+			switch(extension) {
+			case 1:
+				pp.selack = pp.payload;
+				break;
+			case 2:
+				if (pp.payload[-1] != 8) {
+					#if UTP_DEBUG_LOGGING
+					log(UTP_LOG_DEBUG, "Invalid len of extension bits header");
+					#endif
+					return false;
+				}
+				memcpy(extensions_, pp.payload, 8);
+
+				#if UTP_DEBUG_LOGGING
+				log(UTP_LOG_DEBUG, "got extension bits:%02x%02x%02x%02x%02x%02x%02x%02x",
+					extensions_[0], extensions_[1], extensions_[2], extensions_[3],
+					extensions_[4], extensions_[5], extensions_[6], extensions_[7]);
+				#endif
+			}
+			extension = pp.payload[-2];
+			pp.payload += pp.payload[-1];
+		} while (extension);
+	}
+
+	return true;
+}
+
+size_t UtpSocket::process_acks(const ParsedPacket& pp, int acks, uint64 time)
+{
 	size_t acked_bytes = 0;
 
 	int64 min_rtt = INT64_MAX;
@@ -294,18 +321,19 @@ size_t UtpSocket::process_incoming(const byte *packet, size_t len, bool syn)
 			min_rtt = min<int64>(min_rtt, 50000);
 	}
 
-	if (selack_ptr != NULL) {
-		acked_bytes += selective_ack_bytes((pk_ack_nr_ + 2) & ACK_NR_MASK,
-												 selack_ptr, selack_ptr[-1], min_rtt);
+	if (pp.selack != NULL) {
+		acked_bytes += selective_ack_bytes((pp.ack_nr + 2) & ACK_NR_MASK,
+												 pp.selack, pp.selack[-1], min_rtt);
 	}
 
 	#if UTP_DEBUG_LOGGING
+	const uint seqnr_dbg = (pp.seq_nr - ack_nr_ - 1) & SEQ_NR_MASK;
 	log(UTP_LOG_DEBUG, "acks:%d acked_bytes:%u seq_nr_:%d cur_window_:%u cur_window_packets_:%u relative_seqnr:%u max_window_:%u min_rtt:%u rtt:%u",
 		acks, (uint)acked_bytes, seq_nr_, (uint)cc_.cur_window(), cur_window_packets_,
-		seqnr, (uint)cc_.max_window(), (uint)(min_rtt / 1000), cc_.rtt_ms());
+		seqnr_dbg, (uint)cc_.max_window(), (uint)(min_rtt / 1000), cc_.rtt_ms());
 	#endif
 
-	uint64 p = pf1->tv_usec;
+	uint64 p = pp.timestamp;
 
 	last_measured_delay_ = ctx->current_ms_;
 
@@ -320,7 +348,7 @@ size_t UtpSocket::process_incoming(const byte *packet, size_t len, bool syn)
 			cc_.our_hist().shift(prev_delay_base - cc_.their_hist().delay_base);
 		}
 	}
-	const uint32 actual_delay = (uint32(pf1->reply_micro) == INT_MAX ? 0 : uint32(pf1->reply_micro));
+	const uint32 actual_delay = (uint32(pp.reply_micro) == INT_MAX ? 0 : uint32(pp.reply_micro));
 
 	if (actual_delay != 0) {
 		cc_.our_hist().add_sample(actual_delay, ctx->current_ms_);
@@ -368,16 +396,21 @@ size_t UtpSocket::process_incoming(const byte *packet, size_t len, bool syn)
 				cc_.last_maxed_out_window(), (int)opt_sndbuf_, uint64(ctx->current_ms_));
 	}
 
+	return acked_bytes;
+}
+
+void UtpSocket::advance_send_window(const ParsedPacket& pp, int acks)
+{
 	if (acks <= cur_window_packets_) {
-		max_window_user_ = pf1->windowsize;
+		max_window_user_ = pp.windowsize;
 
 		if (max_window_user_ == 0)
 			cc_.set_zerowindow_time(ctx->current_ms_ + 15000);
 
-		if (pk_flags == ST_DATA && state_ == CS_SYN_RECV) {
+		if (pp.type == ST_DATA && state_ == CS_SYN_RECV) {
 			state_ = CS_CONNECTED;
 		}
-		if (pk_flags == ST_STATE && state_ == CS_SYN_SENT)	{
+		if (pp.type == ST_STATE && state_ == CS_SYN_SENT)	{
 			state_ = CS_CONNECTED;
 
 			utp_call_on_connect(ctx, this);
@@ -389,8 +422,8 @@ size_t UtpSocket::process_incoming(const byte *packet, size_t len, bool syn)
 			}
 		}
 		if (wrapping_compare_less(fast_resend_seq_nr_
-			, (pk_ack_nr_ + 1) & ACK_NR_MASK, ACK_NR_MASK))
-			fast_resend_seq_nr_ = (pk_ack_nr_ + 1) & ACK_NR_MASK;
+			, (pp.ack_nr + 1) & ACK_NR_MASK, ACK_NR_MASK))
+			fast_resend_seq_nr_ = (pp.ack_nr + 1) & ACK_NR_MASK;
 
 		#if UTP_DEBUG_LOGGING
 		log(UTP_LOG_DEBUG, "fast_resend_seq_nr_:%u", fast_resend_seq_nr_);
@@ -466,50 +499,27 @@ size_t UtpSocket::process_incoming(const byte *packet, size_t len, bool syn)
 			}
 		}
 	}
-	if (selack_ptr != NULL) {
-		selective_ack(pk_ack_nr_ + 2, selack_ptr, selack_ptr[-1]);
-	}
+}
 
-	assert(cur_window_packets_ == 0 || outbuf_.get(seq_nr_ - cur_window_packets_));
-
-	#if UTP_DEBUG_LOGGING
-	log(UTP_LOG_DEBUG, "acks:%d acked_bytes:%u seq_nr_:%u cur_window_:%u cur_window_packets_:%u ",
-		acks, (uint)acked_bytes, seq_nr_, (uint)cc_.cur_window(), cur_window_packets_);
-	#endif
-
-	if (state_ == CS_CONNECTED_FULL && !is_full()) {
-		state_ = CS_CONNECTED;
+size_t UtpSocket::deliver_data(const ParsedPacket& pp, uint seqnr)
+{
+	if (pp.type == ST_FIN && !recv_.got_fin) {
 		#if UTP_DEBUG_LOGGING
-		log(UTP_LOG_DEBUG, "Socket writable. max_window_:%u cur_window_:%u packet_size:%u",
-			(uint)cc_.max_window(), (uint)cc_.cur_window(), (uint)get_packet_size());
-		#endif
-		utp_call_on_state_change(ctx, this, UTP_STATE_WRITABLE);
-	}
-	if (pk_flags == ST_STATE) {
-		return 0;
-	}
-	if (state_ != CS_CONNECTED &&
-		state_ != CS_CONNECTED_FULL) {
-		return 0;
-	}
-
-	if (pk_flags == ST_FIN && !recv_.got_fin) {
-		#if UTP_DEBUG_LOGGING
-		log(UTP_LOG_DEBUG, "Got FIN eof_pkt_:%u", pk_seq_nr_);
+		log(UTP_LOG_DEBUG, "Got FIN eof_pkt_:%u", pp.seq_nr);
 		#endif
 		recv_.got_fin = true;
-		eof_pkt_ = pk_seq_nr_;
+		eof_pkt_ = pp.seq_nr;
 	}
 
 	if (seqnr == 0) {
-		size_t count = packet_end - data;
+		size_t count = pp.end - pp.payload;
 		if (count > 0 && !recv_.read_shutdown) {
 
 			#if UTP_DEBUG_LOGGING
 			log(UTP_LOG_DEBUG, "Got Data len:%u (rb:%u)", (uint)count, (uint)utp_call_get_read_buffer_size(ctx, this));
 			#endif
 
-			utp_call_on_read(ctx, this, data, count);
+			utp_call_on_read(ctx, this, pp.payload, count);
 		}
 		ack_nr_++;
 
@@ -547,11 +557,11 @@ size_t UtpSocket::process_incoming(const byte *packet, size_t len, bool syn)
 		}
 		schedule_ack();
 	} else {
-		if (recv_.got_fin && pk_seq_nr_ > eof_pkt_) {
+		if (recv_.got_fin && pp.seq_nr > eof_pkt_) {
 			#if UTP_DEBUG_LOGGING
 			log(UTP_LOG_DEBUG, "Got an invalid packet sequence number, past EOF "
 				"reorder_count_:%u len:%u (rb:%u)",
-				reorder_count_, (uint)(packet_end - data), (uint)utp_call_get_read_buffer_size(ctx, this));
+				reorder_count_, (uint)(pp.end - pp.payload), (uint)utp_call_get_read_buffer_size(ctx, this));
 			#endif
 			return 0;
 		}
@@ -561,14 +571,14 @@ size_t UtpSocket::process_incoming(const byte *packet, size_t len, bool syn)
 			#if UTP_DEBUG_LOGGING
 			log(UTP_LOG_DEBUG, "0x%08x: Got an invalid packet sequence number, too far off "
 				"reorder_count_:%u len:%u (rb:%u)",
-				reorder_count_, (uint)(packet_end - data), (uint)utp_call_get_read_buffer_size(ctx, this));
+				reorder_count_, (uint)(pp.end - pp.payload), (uint)utp_call_get_read_buffer_size(ctx, this));
 			#endif
 			return 0;
 		}
 
-		inbuf_.ensure_size(pk_seq_nr_ + 1, seqnr + 1);
+		inbuf_.ensure_size(pp.seq_nr + 1, seqnr + 1);
 
-		if (inbuf_.get(pk_seq_nr_) != NULL) {
+		if (inbuf_.get(pp.seq_nr) != NULL) {
 			#ifdef _DEBUG
 			++stats_.nduprecv;
 			#endif
@@ -577,23 +587,23 @@ size_t UtpSocket::process_incoming(const byte *packet, size_t len, bool syn)
 		}
 
 		auto *pkt = new InboundPacket;
-		pkt->size = (uint32_t)(packet_end - data);
-		pkt->data.assign(data, packet_end);
+		pkt->size = (uint32_t)(pp.end - pp.payload);
+		pkt->data.assign(pp.payload, pp.end);
 
-		assert(inbuf_.get(pk_seq_nr_) == NULL);
-		assert((pk_seq_nr_ & inbuf_.mask()) != ((ack_nr_+1) & inbuf_.mask()));
-		inbuf_.put(pk_seq_nr_, pkt);
+		assert(inbuf_.get(pp.seq_nr) == NULL);
+		assert((pp.seq_nr & inbuf_.mask()) != ((ack_nr_+1) & inbuf_.mask()));
+		inbuf_.put(pp.seq_nr, pkt);
 		reorder_count_++;
 
 		#if UTP_DEBUG_LOGGING
 		log(UTP_LOG_DEBUG, "0x%08x: Got out of order data reorder_count_:%u len:%u (rb:%u)",
-			reorder_count_, (uint)(packet_end - data), (uint)utp_call_get_read_buffer_size(ctx, this));
+			reorder_count_, (uint)(pp.end - pp.payload), (uint)utp_call_get_read_buffer_size(ctx, this));
 		#endif
 
 		schedule_ack();
 	}
 
-	return (size_t)(packet_end - data);
+	return (size_t)(pp.end - pp.payload);
 }
 
 inline byte UTP_Version(PacketFormatV1 const* pf)
