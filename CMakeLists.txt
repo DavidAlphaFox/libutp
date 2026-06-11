@@ -25,6 +25,7 @@ option(UTP_DEBUG_LOGGING    "启用详细调试日志"          OFF)
 option(UTP_ENABLE_STATS     "启用 utp_get_stats() 和额外检查" OFF)
 option(UTP_SANITIZE         "启用 AddressSanitizer + UBSan（作用于全部目标）" OFF)
 option(UTP_BUILD_FUZZERS    "构建 libFuzzer 模糊测试目标（需 Clang）" OFF)
+option(UTP_BUILD_UV_EXAMPLE "构建 uv-utp-chat 示例（需 libuv + TBB）" OFF)
 
 # ── Sanitizers ────────────────────────────────────────────
 if(UTP_SANITIZE)
@@ -38,6 +39,12 @@ if(UTP_BUILD_FUZZERS)
     add_compile_options(-fsanitize=fuzzer-no-link)
 endif()
 
+# ── 测试开关（须在 examples 之前启用：uv-utp-chat 注册自检用例）──
+option(BUILD_TESTING "构建测试" ON)
+if(BUILD_TESTING)
+    enable_testing()
+endif()
+
 # ── 库 ───────────────────────────────────────────────────
 add_subdirectory(src)
 
@@ -47,9 +54,7 @@ if(UTP_BUILD_EXAMPLES)
 endif()
 
 # ── 测试 ───────────────────────────────────────────────────
-option(BUILD_TESTING "构建测试" ON)
 if(BUILD_TESTING)
-    enable_testing()
     add_subdirectory(tests)
 endif()
 

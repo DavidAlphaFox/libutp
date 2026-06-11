@@ -27,8 +27,9 @@ libutp/
 │   ├── utp_internal.cpp  # 核心协议实现（连接管理、拥塞控制、超时重传）
 │   ├── utp_callbacks.cpp # 回调函数
 │   └── utp_utils.cpp     # 工具函数（时间、MTU）
-├── examples/             # 示例程序
-│   └── ucat.c            # 简单的 uTP 客户端/服务端
+├── examples/             # 示例程序（见 examples/README.md）
+│   ├── ucat.c            # 最小示例：单连接、阻塞 select（netcat 风格）
+│   └── uv-utp-chat/      # 生产形态示例：libuv 事件循环 + TBB 线程池多客户端聊天
 ├── tests/                # Catch2 单元测试
 ├── cmake/                # CMake 模块
 └── CMakeLists.txt        # 根构建配置
@@ -75,16 +76,27 @@ cd build && ctest --output-on-failure
 |------|------|--------|
 | `UTP_BUILD_SHARED` | 构建动态库而非静态库 | OFF |
 | `UTP_BUILD_EXAMPLES` | 构建示例程序（ucat） | ON |
+| `UTP_BUILD_UV_EXAMPLE` | 构建 uv-utp-chat 示例（需 libuv + TBB） | OFF |
 | `UTP_DEBUG_LOGGING` | 启用详细调试日志 | OFF |
 | `UTP_ENABLE_STATS` | 启用统计信息和额外检查 | OFF |
+| `UTP_SANITIZE` | AddressSanitizer + UBSan（全部目标） | OFF |
+| `UTP_BUILD_FUZZERS` | libFuzzer 模糊测试目标（需 Clang） | OFF |
+| `UTP_BUILD_BENCH` | 内存回环吞吐基准 | OFF |
 | `BUILD_TESTING` | 构建单元测试 | ON |
 
 ### 示例
 
 ```bash
+# ucat：最小示例（netcat 风格）
 cmake --build build --target ucat
 ./build/examples/ucat <host> <port>
+
+# uv-utp-chat：libuv + TBB 多客户端聊天（设计与架构见 examples/uv-utp-chat/README.md）
+cmake -B build -DUTP_BUILD_UV_EXAMPLE=ON && cmake --build build
+./build/examples/uv-utp-chat/utp_chat_server --self-test
 ```
+
+各示例的定位与设计文档见 [examples/README.md](examples/README.md)。
 
 ## 重构说明
 

@@ -13,3 +13,8 @@ endif()
 if(LINUX)
     target_compile_definitions(ucat PRIVATE __linux__)
 endif()
+
+# ── uv-utp-chat example（libuv + TBB，需 UTP_BUILD_UV_EXAMPLE=ON）─
+if(UTP_BUILD_UV_EXAMPLE)
+    add_subdirectory(uv-utp-chat)
+endif()
