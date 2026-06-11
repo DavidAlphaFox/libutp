@@ -37,8 +37,13 @@
 #include "utp/endian.hpp"
 #include "utp/socket_host.hpp"
 
-extern char addrbuf[65];
-#define addrfmt(x, s) x.fmt(s, sizeof(s))
+// 地址格式化辅助：把地址写进按值传入的临时缓冲并返回其内部指针。
+// 返回指针仅在当前完整表达式内有效，适合直接作为日志参数；
+// 取代原先的全局可变缓冲 addrbuf（多 context / 多线程下不安全）。
+struct AddrFmtBuf { char s[65]; };
+inline const char* addrfmt(const utp::Address& addr, AddrFmtBuf&& buf = {}) {
+	return addr.fmt(buf.s, sizeof(buf.s));
+}
 
 class UtpSocket;
 
@@ -74,11 +79,8 @@ struct UtpSocketKey {
 	utp::Address addr;
 	uint32 recv_id;		 // "conn_seed", "conn_id"
 
-	UtpSocketKey(const utp::Address& _addr, uint32 _recv_id) {
-		memset(this, 0, sizeof(*this));
-		addr = _addr;
-		recv_id = _recv_id;
-	}
+	UtpSocketKey(const utp::Address& _addr, uint32 _recv_id)
+		: addr(_addr), recv_id(_recv_id) {}
 
 	bool operator == (const UtpSocketKey &other) const {
 		return recv_id == other.recv_id && addr == other.addr;
@@ -96,9 +98,10 @@ struct UtpSocketKeyHash {
 };
 
 // SocketMap: 所有活跃 uTP 连接的哈希表。
-// 键为 UtpSocketKey (对端地址+接收连接ID),值为 UtpSocket 裸指针。
-// UtpContext 拥有所有 socket 的生命周期,负责析构时统一释放。
-using SocketMap = std::unordered_map<UtpSocketKey, UtpSocket*, UtpSocketKeyHash>;
+// 键为 UtpSocketKey (对端地址+接收连接ID)。
+// 哈希表以 unique_ptr 持有 socket 所有权：注册即移交，销毁经 destroy_socket
+// 或 ~UtpContext 统一释放，不再依赖手动 delete。
+using SocketMap = std::unordered_map<UtpSocketKey, std::unique_ptr<UtpSocket>, UtpSocketKeyHash>;
 
 // UtpContext: uTP 协议库全局上下文,所有套接字共享一个 context 实例。
 // 整个库采用单线程事件驱动模型,context 持有回调表、活跃套接字表、待发 ACK 列表、
@@ -110,6 +113,7 @@ public:
 
 	void log(int level, utp_socket *socket, char const *fmt, ...);
 	void log_unchecked(utp_socket *socket, char const *fmt, ...);
+	void vlog_unchecked(utp_socket *socket, char const *fmt, va_list va);
 	// ISocketHost：按 level 过滤日志（内联，供多 TU 调用）
 	bool would_log(int level) override {
 		if (level == UTP_LOG_NORMAL) return log_normal_;
@@ -163,6 +167,10 @@ private:
 	// 再尝试 id±1 且发送方向 ID 等于 id 的连接（对端视角的 ID 偏移）。
 	// RST 处理与 ICMP 错误归属共用此规则。
 	UtpSocket* find_socket_for_id(const utp::Address &addr, uint32 id);
+
+	// 从注册表移除并销毁 socket（唯一的逐个销毁入口）。
+	// 先把所有权移出哈希表再析构，保证 ~UtpSocket 的回调期间容器不被重入修改。
+	void destroy_socket(UtpSocket* s);
 
 	void *userdata_;
 	std::unique_ptr<UtpCallbacks> callbacks_;

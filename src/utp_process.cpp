@@ -285,7 +285,7 @@ size_t UtpSocket::process_acks(const ParsedPacket& pp, int acks, uint64 time)
 
 	for (int i = 0; i < acks; ++i) {
 		int seq = (send_.seq_nr - send_.cur_window_packets + i) & ACK_NR_MASK;
-		OutgoingPacket *pkt = (OutgoingPacket*)send_.outbuf.get(seq);
+		OutgoingPacket *pkt = send_.outbuf.get(seq);
 		if (pkt == 0 || pkt->transmissions == 0) continue;
 		assert((int)(pkt->payload) >= 0);
 		acked_bytes += pkt->payload;
@@ -410,7 +410,7 @@ void UtpSocket::advance_send_window(const ParsedPacket& pp, int acks)
 			int ack_status = ack_packet(send_.seq_nr - send_.cur_window_packets);
 			if (ack_status == 2) {
 				#ifdef _DEBUG
-				OutgoingPacket* pkt = (OutgoingPacket*)send_.outbuf.get(send_.seq_nr - send_.cur_window_packets);
+				OutgoingPacket* pkt = send_.outbuf.get(send_.seq_nr - send_.cur_window_packets);
 				assert(pkt->transmissions == 0);
 				#endif
 
@@ -445,7 +445,7 @@ void UtpSocket::advance_send_window(const ParsedPacket& pp, int acks)
 
 		assert(send_.cur_window_packets == 0 || send_.outbuf.get(send_.seq_nr - send_.cur_window_packets));
 		if (send_.cur_window_packets == 1) {
-			OutgoingPacket *pkt = (OutgoingPacket*)send_.outbuf.get(send_.seq_nr - 1);
+			OutgoingPacket *pkt = send_.outbuf.get(send_.seq_nr - 1);
 			if (pkt->transmissions == 0) {
 				send_packet(pkt);
 			}
@@ -460,7 +460,7 @@ void UtpSocket::advance_send_window(const ParsedPacket& pp, int acks)
 			if (((send_.seq_nr - send_.cur_window_packets) & ACK_NR_MASK) != timing_.fast_resend_seq_nr) {
 				timing_.fast_timeout_ = false;
 			} else {
-				OutgoingPacket *pkt = (OutgoingPacket*)send_.outbuf.get(send_.seq_nr - send_.cur_window_packets);
+				OutgoingPacket *pkt = send_.outbuf.get(send_.seq_nr - send_.cur_window_packets);
 				if (pkt && pkt->transmissions > 0) {
 
 					#if UTP_DEBUG_LOGGING
@@ -519,15 +519,14 @@ size_t UtpSocket::deliver_data(const ParsedPacket& pp, uint seqnr)
 			if (recv_.reorder_count == 0)
 				break;
 
-			auto *pkt = (InboundPacket*)recv_.inbuf.get(recv_.ack_nr+1);
+			// 取走所有权，循环迭代结束时自动释放
+			std::unique_ptr<InboundPacket> pkt = recv_.inbuf.take(recv_.ack_nr+1);
 			if (pkt == NULL)
 				break;
-			recv_.inbuf.put(recv_.ack_nr+1, NULL);
 			count = pkt->size;
 			if (count > 0 && !recv_.read_shutdown) {
 				utp_call_on_read(conn_.host->handle(), this, pkt->data.data(), count);
 			}
-			delete pkt;
 			recv_.ack_nr++;
 
 			assert(recv_.reorder_count > 0);
@@ -566,13 +565,13 @@ size_t UtpSocket::deliver_data(const ParsedPacket& pp, uint seqnr)
 			return 0;
 		}
 
-		auto *pkt = new InboundPacket;
+		auto pkt = std::make_unique<InboundPacket>();
 		pkt->size = (uint32_t)(pp.end - pp.payload);
 		pkt->data.assign(pp.payload, pp.end);
 
 		assert(recv_.inbuf.get(pp.seq_nr) == NULL);
 		assert((pp.seq_nr & recv_.inbuf.mask()) != ((recv_.ack_nr+1) & recv_.inbuf.mask()));
-		recv_.inbuf.put(pp.seq_nr, pkt);
+		recv_.inbuf.put(pp.seq_nr, std::move(pkt));
 		recv_.reorder_count++;
 
 		#if UTP_DEBUG_LOGGING
@@ -603,7 +602,7 @@ int UtpContext::process_udp(const byte *buffer, size_t len, const struct sockadd
 
 	if (len < sizeof(PacketFormatV1)) {
 		#if UTP_DEBUG_LOGGING
-		log(UTP_LOG_DEBUG, NULL, "recv %s len:%u too small", addrfmt(addr, addrbuf), (uint)len);
+		log(UTP_LOG_DEBUG, NULL, "recv %s len:%u too small", addrfmt(addr), (uint)len);
 		#endif
 		return 0;
 	}
@@ -614,14 +613,14 @@ int UtpContext::process_udp(const byte *buffer, size_t len, const struct sockadd
 
 	if (version != 1) {
 		#if UTP_DEBUG_LOGGING
-		log(UTP_LOG_DEBUG, NULL, "recv %s len:%u version:%u unsupported version", addrfmt(addr, addrbuf), (uint)len, version);
+		log(UTP_LOG_DEBUG, NULL, "recv %s len:%u version:%u unsupported version", addrfmt(addr), (uint)len, version);
 		#endif
 
 		return 0;
 	}
 
 	#if UTP_DEBUG_LOGGING
-	log(UTP_LOG_DEBUG, NULL, "recv %s len:%u id:%u", addrfmt(addr, addrbuf), (uint)len, id);
+	log(UTP_LOG_DEBUG, NULL, "recv %s len:%u id:%u", addrfmt(addr), (uint)len, id);
 	log(UTP_LOG_DEBUG, NULL, "recv id:%u seq_nr:%u ack_nr:%u", id, (uint)pf1->seq_nr, (uint)pf1->ack_nr);
 	#endif
 	const byte flags = pf1->type();
@@ -649,7 +648,7 @@ int UtpContext::process_udp(const byte *buffer, size_t len, const struct sockadd
 		} else {
 			auto it = sockets_.find(UtpSocketKey(addr, id));
 			if (it != sockets_.end()) {
-				conn = it->second;
+				conn = it->second.get();
 				last_utp_socket_ = conn;
 			}
 		}
@@ -708,7 +707,7 @@ int UtpContext::process_udp(const byte *buffer, size_t len, const struct sockadd
 	if (true) {
 
 		#if UTP_DEBUG_LOGGING
-		log(UTP_LOG_DEBUG, NULL, "Incoming connection from %s", addrfmt(addr, addrbuf));
+		log(UTP_LOG_DEBUG, NULL, "Incoming connection from %s", addrfmt(addr));
 		#endif
 
 		if (sockets_.count(UtpSocketKey(addr, id + 1))) {
@@ -773,7 +772,7 @@ UtpSocket* UtpContext::parse_icmp_payload(const byte *buffer, size_t len, const 
 
 	if (len < sizeof(PacketFormatV1)) {
 		#if UTP_DEBUG_LOGGING
-		log(UTP_LOG_DEBUG, NULL, "Ignoring ICMP from %s: runt length %d", addrfmt(addr, addrbuf), len);
+		log(UTP_LOG_DEBUG, NULL, "Ignoring ICMP from %s: runt length %d", addrfmt(addr), len);
 		#endif
 		return NULL;
 	}
@@ -784,7 +783,7 @@ UtpSocket* UtpContext::parse_icmp_payload(const byte *buffer, size_t len, const 
 
 	if (version != 1) {
 		#if UTP_DEBUG_LOGGING
-		log(UTP_LOG_DEBUG, NULL, "Ignoring ICMP from %s: not UTP version 1", addrfmt(addr, addrbuf));
+		log(UTP_LOG_DEBUG, NULL, "Ignoring ICMP from %s: not UTP version 1", addrfmt(addr));
 		#endif
 		return NULL;
 	}
@@ -795,7 +794,7 @@ UtpSocket* UtpContext::parse_icmp_payload(const byte *buffer, size_t len, const 
 	}
 
 	#if UTP_DEBUG_LOGGING
-	log(UTP_LOG_DEBUG, NULL, "Ignoring ICMP from %s: No matching connection found for id %u", addrfmt(addr, addrbuf), id);
+	log(UTP_LOG_DEBUG, NULL, "Ignoring ICMP from %s: No matching connection found for id %u", addrfmt(addr), id);
 	#endif
 	return NULL;
 }
@@ -803,13 +802,13 @@ UtpSocket* UtpContext::parse_icmp_payload(const byte *buffer, size_t len, const 
 UtpSocket* UtpContext::find_socket_for_id(const utp::Address &addr, uint32 id)
 {
 	if (auto it = sockets_.find(UtpSocketKey(addr, id)); it != sockets_.end()) {
-		return it->second;
+		return it->second.get();
 	}
 	if (auto it = sockets_.find(UtpSocketKey(addr, id + 1)); it != sockets_.end() && it->second->conn_id_send() == id) {
-		return it->second;
+		return it->second.get();
 	}
 	if (auto it = sockets_.find(UtpSocketKey(addr, id - 1)); it != sockets_.end() && it->second->conn_id_send() == id) {
-		return it->second;
+		return it->second.get();
 	}
 	return nullptr;
 }
