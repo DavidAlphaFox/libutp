@@ -1,6 +1,51 @@
-# 面向对象重构（接口化 + 高内聚低耦合）
+# 质量与性能强化（测试兑现 + 类型安全 + 测量驱动优化）
 
-> **状态（2026-06-11 第三次更新）**：5 个阶段全部完成并验证（工作区待提交）。
+> **状态（2026-06-11 第四次更新）**：两个阶段全部完成并验证（工作区待提交）。
+> 验证基线升级：64 个 ctest 用例（Debug + ASan/UBSan 双跑）、libFuzzer 累计
+> 160 万+ 次执行零发现、四配置零错误构建、`nm` 28 个公开 C 符号不变、
+> ucat 回环 10MB 逐字节一致。
+
+## 阶段 A：测试兑现 + 类型安全 + 工程化（8 项）
+
+| 项 | 内容 |
+|----|------|
+| 测试基建 | Catch2 改 `find_package` 优先 + FetchContent 兜底（原硬编码 `/tmp/catch2_src` 已坏） |
+| 类型安全 | `SequenceBuffer<T>`（`unique_ptr<T>` 持有元素，新增 `take()`），消灭全部 void* 强转与手动 delete |
+| 所有权 | `SocketMap` 持 `unique_ptr<UtpSocket>`；`destroy_socket` 为唯一销毁入口（先移出哈希表再析构，杜绝析构回调重入容器）；`UtpSocketKey` memset 改成员初始化；全局 `addrbuf` 改按值临时缓冲 `addrfmt` |
+| 文件职责 | `utp_api.cpp` 1147→517 行（纯 C 薄包装+回调适配器）；新建 `utp_context.cpp` 收纳全部 UtpContext 实现 |
+| 单元测试 | `test_ledbat.cpp`（13 例）、`test_mtu_discovery.cpp`（8 例） |
+| 集成测试 | `test_loopback.cpp`：双 context 内存互递 + 假时钟 + 固定种子故障注入（丢包/乱序/重复），5 场景毫秒级完成 |
+| 工程化 | `UTP_SANITIZE` 选项；install + `utpConfig.cmake` + pkg-config；GitHub Actions 矩阵（4 配置 + 符号检查 + 回环 + fuzz 冒烟）；`.clang-format`/`.clang-tidy` |
+
+### 阶段 A 发现并修复的 3 个真实 bug
+
+1. **SACK 位图堆越界读**（上游 libutp 继承）：`selective_ack_bytes` 首轮迭代 `bits == len*8` 读 `mask[len]`，ASan 在丢包回环中捕获；已加上界检查。
+2. **C 回调丢失 `args->context`**：回调接口化时 `CFunctionCallbackAdapter::make_args` 漏填 context（违反上游 C API 约定）；适配器现持宿主回指针统一回填。
+3. **日志 va_list 误转发**：`UtpContext::log` 把 `va_list` 当可变参数传给 `log_unchecked(...)`，带参日志输出垃圾值；新增 `vlog_unchecked(va_list)` 出口。
+
+## 阶段 B：fuzzing + 测量驱动性能优化
+
+- **libFuzzer harness**（`fuzz/fuzz_process_udp.cpp`，`UTP_BUILD_FUZZERS=ON` 需 Clang）：
+  分帧选择子驱动 `process_udp`/ICMP/超时路径，确定性回调保证可复现；
+  ASan+UBSan 下累计 160 万+ 次执行、覆盖率驱动语料 2200+，零崩溃零断言。CI 加 60s 冒烟 job。
+- **吞吐基准**（`bench/bench_loopback.cpp`，`UTP_BUILD_BENCH=ON`）：双 context 内存回环 +
+  全局 operator new 计数。基线 256MB：**2509 MB/s，3005 次堆分配/MB**。
+- **perf 定位热点**：`flush_packets` self-time **36%**——每次调用从窗口头线性扫描，
+  大窗口下 O(窗口²)；malloc 仅 ~2.5%。
+- **优化（flush_scan_start 游标）**：`SendState` 维护"已发送前缀"游标，扫描从第一个
+  未发送/待重传包开始；唯一批量置 `need_resend` 的 RTO 路径重置游标回窗口头。
+  结果 **2509 → ~4260 MB/s（+70%）**，优化后剖面平坦（无函数 >4%）。
+- **池化结论：不做**。优化后 malloc/free 合计仅 ~7%（综合基准，真实场景网络受限），
+  数据不支持引入对象池的复杂度。
+- 顺手：`LedbatController` 接口方法补全 `override`；`UtpSocket`/`UtpContext` 前置声明
+  统一为 `struct`（与 `utp.h` 的 typedef 一致，消除 MSVC ABI 告警）；connect 日志
+  format 截断修正。
+
+---
+
+# （历史）面向对象重构（接口化 + 高内聚低耦合）
+
+> **状态（2026-06-11 第三次更新）**：5 个阶段全部完成并验证（已提交）。
 > 目标：进一步面向对象（继承/设计模式）+ 每个类高内聚低耦合。
 > 取舍原则：只在能真正降低耦合处引入模式，避免"为模式而模式"反增耦合。
 > 验证：每阶段均经 Debug / Release / `-DUTP_DEBUG_LOGGING=ON` 三配置零错误构建，
