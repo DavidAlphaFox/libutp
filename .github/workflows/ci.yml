@@ -53,6 +53,24 @@ jobs:
           kill $SRV 2>/dev/null || true
           cmp in.bin out.bin
 
+  uv-example:
+    name: uv-utp-chat (libuv + TBB)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install libuv + TBB
+        run: sudo apt-get update && sudo apt-get install -y libuv1-dev libtbb-dev
+
+      - name: Configure
+        run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Debug -DUTP_BUILD_UV_EXAMPLE=ON
+
+      - name: Build
+        run: cmake --build build -j$(nproc)
+
+      - name: Self-test (1 server + 3 clients in-process)
+        run: ./build/examples/uv-utp-chat/utp_chat_server --self-test
+
   fuzz-smoke:
     name: Fuzz (libFuzzer, 60s)
     runs-on: ubuntu-latest

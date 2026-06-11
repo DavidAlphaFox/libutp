@@ -41,6 +41,24 @@
   统一为 `struct`（与 `utp.h` 的 typedef 一致，消除 MSVC ABI 告警）；connect 日志
   format 截断修正。
 
+## 阶段 C：uv-utp-chat 示例（libuv + libutp + TBB，C++23）
+
+`examples/uv-utp-chat/`（`UTP_BUILD_UV_EXAMPLE=ON`，缺依赖自动跳过）：
+
+- **架构**：libuv 拥有线程与 I/O（UDP/定时器/uv_async），libutp 拥有连接与可靠性
+  （N 客户端复用一个 UDP 端口），TBB 只做计算；utp 句柄永不出 loop 线程，
+  跨线程只传值（连接 id + 字节拷贝），全程无锁。
+- **组件**：`UtpUvNode`（libutp↔libuv 胶水，server/client 共用）、
+  `TbbBridge`（task_arena + concurrent_queue + uv_async 回流）、
+  `protocol.h`（4B 长度前缀分帧）、`server.cpp`（TBB 加工后广播）、
+  `client.cpp`（-n K 单进程多连接）。
+- **关键机制**：`UTP_SENDTO`→`uv_udp_try_send`（零拷贝，EAGAIN 丢弃靠重传兜底）；
+  线程池积压字节经 `UTP_GET_READ_BUFFER_SIZE` 收缩接收窗口（端到端回压闭环）；
+  关闭顺序 = 连接 FIN 清零 → 关 uv 句柄 → `utp_destroy` 最后。
+- **验证**：`--self-test`（同进程 1 server + 3 client 各发 100 条、各收齐 200 条）
+  注册为 ctest 用例（65/65，含 ASan 配置）并加入 CI job；多进程手动互通验证；
+  `enable_testing()` 已提前到 examples 之前（否则示例的 add_test 不生效）。
+
 ---
 
 # （历史）面向对象重构（接口化 + 高内聚低耦合）
