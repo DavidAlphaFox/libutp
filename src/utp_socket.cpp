@@ -75,8 +75,6 @@ using std::min;
 using std::max;
 using std::clamp;
 
-char addrbuf[65];
-
 // ============================================================================
 // 连接状态机：State 模式具体状态（无数据单例）。
 // 每个 CONN_STATE 对应一个状态类，封装该状态下 close/shutdown 的行为，以及
@@ -214,127 +212,6 @@ void UtpSocket::remove_from_ack_list()
 }
 
 // -----------------------------------------------------------------------------
-// 函数：utp_register_sent_packet
-// 功能：将本次发送的 UDP 数据包按尺寸分类，累加到上下文统计计数器中。
-//
-// 上下文：
-//   维护 utp_context 中的原始（raw）发送统计。统计按尺寸分为 5 个桶：
-//   EMPTY / SMALL / MID / BIG / HUGE，用于上层分析流量特征。
-//
-// 参数：
-//   ctx    - 指向 utp_context 全局上下文的指针。
-//   length - 本次发送数据包的字节数。
-//
-// 桶边界（典型值，参见 utp::wire::packet_size_from_bucket）：
-//   EMPTY  ≤ 23B
-//   SMALL  ≤ 373B
-//   MID    ≤ 723B
-//   BIG    ≤ 1400B
-//   HUGE   > 1400B
-//
-// 注意：
-//   该函数仅在 UTP_ENABLE_STATS 编译选项启用时被调用，目前总是被调用
-//   （由 send_to_addr 调用），通过条件编译控制编译产物。
-// -----------------------------------------------------------------------------
-void UtpContext::register_sent_packet(size_t length)
-{
-	context_stats_._nraw_send[utp::wire::packet_size_bucket(length)]++;
-}
-
-// ============================================================================
-// ISocketHost 接口实现：这些方法需要 UtpSocket 完整类型（访问 ack_index 等），
-// 故定义在 .cpp（此处 UtpSocket 已完整）。UtpSocket 通过 ISocketHost* 调用它们，
-// 不再 friend 访问 UtpContext 私有成员。
-// ============================================================================
-
-// 用 get_milliseconds 回调刷新缓存时钟并返回新值
-uint64 UtpContext::refresh_clock(UtpSocket* who)
-{
-	current_ms_ = utp_call_get_milliseconds(this, who);
-	return current_ms_;
-}
-
-// 延迟 ACK 登记：去重后加入列表尾，把下标回写到 socket
-void UtpContext::schedule_ack(UtpSocket* s)
-{
-	if (s->ack_index() == -1) {
-		ack_sockets_.push_back(s);
-		s->set_ack_index((int)ack_sockets_.size() - 1);
-	}
-}
-
-// 延迟 ACK 注销：swap-pop O(1) 移除，并修正被移动元素的下标
-void UtpContext::remove_ack(UtpSocket* s)
-{
-	const int idx = s->ack_index();
-	if (idx < 0) return;
-
-	UtpSocket *last = ack_sockets_.back();
-	assert(last->ack_index() < (int)ack_sockets_.size());
-	assert(ack_sockets_[last->ack_index()] == last);
-
-	last->set_ack_index(idx);
-	ack_sockets_[idx] = last;
-	s->set_ack_index(-1);
-	ack_sockets_.pop_back();
-}
-
-// 接收记账：按尺寸桶累加
-void UtpContext::record_raw_recv(size_t len)
-{
-	context_stats_._nraw_recv[utp::wire::packet_size_bucket(len)]++;
-}
-
-// 把 socket 按 (对端地址, 接收连接ID) 登记进注册表
-void UtpContext::register_socket(UtpSocket* s)
-{
-	sockets_[UtpSocketKey(s->peer_addr(), s->recv_conn_id())] = s;
-}
-
-// socket 析构通知：清缓存、从注册表移除
-void UtpContext::on_socket_destroyed(UtpSocket* s)
-{
-	if (last_utp_socket_ == s) {
-		last_utp_socket_ = NULL;
-	}
-	auto erased = sockets_.erase(UtpSocketKey(s->peer_addr(), s->recv_conn_id()));
-	assert(erased == 1);
-	(void)erased;
-}
-
-// -----------------------------------------------------------------------------
-// 函数：send_to_addr
-// 功能：通过 utp 回调接口将一段字节流作为 UDP 数据报发送到指定对端地址。
-//
-// 上下文：
-//   这是 uTP 所有出站数据包的最终发送出口。utp_call_sendto 是一个由调用方
-//   注册的回调函数（参见 utp_callbacks.h），实际执行 sendto() 系统调用。
-//
-// 参数：
-//   ctx    - 指向 utp_context 全局上下文的指针。
-//   p      - 指向待发送数据（含 uTP 头）的缓冲区起始地址。
-//   len    - 待发送的字节数。
-//   addr   - 目标对端的 utp::Address 套接字地址。
-//   flags  - 透传给底层 sendto 的额外标志（如 UTP_UDP_DONTFRAG 表示
-//            在 MTU 探测时禁止分片）。
-//
-// 算法说明：
-//   1. 将 utp::Address 内部存储转换为平台原生 sockaddr 结构。
-//   2. 记录本次发送的长度到 raw 统计。
-//   3. 调用 sendto 回调完成实际发送。
-// -----------------------------------------------------------------------------
-void UtpContext::send_to_addr_impl(const byte *p, size_t len, const utp::Address &addr, int flags)
-{
-	socklen_t tolen;
-	// 取出平台原生 sockaddr 表示
-	SOCKADDR_STORAGE to = addr.get_sockaddr_storage(&tolen);
-	// 计入发送统计
-	register_sent_packet(len);
-	// 通过注册的回调执行真正的 sendto
-	utp_call_sendto(this, NULL, p, len, (const struct sockaddr *)&to, tolen, flags);
-}
-
-// -----------------------------------------------------------------------------
 // 函数：UtpSocket::schedule_ack
 // 功能：将当前 socket 标记为"需要发送 ACK"，加入全局延迟 ACK 处理列表。
 //
@@ -426,7 +303,7 @@ void UtpSocket::send_data(byte* b, size_t length, BandwidthType type, uint32 fla
 	uint16 pkt_seq_nr = b1->seq_nr;
 	uint16 pkt_ack_nr = b1->ack_nr;
 	log(UTP_LOG_DEBUG, "send %s len:%u id:%u timestamp:" I64u " reply_micro_:%u flags:%s pkt_seq_nr:%u pkt_ack_nr:%u",
-		addrfmt(conn_.addr, addrbuf), (uint)length, conn_.conn_id_send, time, timing_.reply_micro, flagnames[flags2],
+		addrfmt(conn_.addr), (uint)length, conn_.conn_id_send, time, timing_.reply_micro, flagnames[flags2],
 		pkt_seq_nr, pkt_ack_nr);
 #endif
 	// 通过回调真正发送 UDP 报文
@@ -713,7 +590,7 @@ bool UtpSocket::flush_packets()
 {
 	size_t packet_size = get_packet_size();
 	for (uint16 i = send_.seq_nr - send_.cur_window_packets; i != send_.seq_nr; ++i) {
-		OutgoingPacket *pkt = (OutgoingPacket*)send_.outbuf.get(i);
+		OutgoingPacket *pkt = send_.outbuf.get(i);
 		if (pkt == 0 || (pkt->transmissions > 0 && pkt->need_resend == false)) continue;
 		if (is_full()) return true;
 
@@ -762,21 +639,23 @@ void UtpSocket::write_outgoing_packet(size_t payload, uint flags, struct utp_iov
 		OutgoingPacket *pkt = NULL;
 
 		if (send_.cur_window_packets > 0) {
-			pkt = (OutgoingPacket*)send_.outbuf.get(send_.seq_nr - 1);
+			pkt = send_.outbuf.get(send_.seq_nr - 1);
 		}
 
 		const size_t header_size = get_header_size();
 		bool append = true;
+		std::unique_ptr<OutgoingPacket> new_pkt;
 
 		if (payload && pkt && !pkt->transmissions && pkt->payload < packet_size) {
+			// 追加到缓冲区中最后一个未发送的包（包仍由 outbuf 持有）
 			added = min(payload + pkt->payload, max<size_t>(packet_size, pkt->payload)) - pkt->payload;
 			pkt->data.resize(header_size + pkt->payload + added);
-			send_.outbuf.put(send_.seq_nr - 1, pkt);
 			append = false;
 			assert(!pkt->need_resend);
 		} else {
 			added = payload;
-			pkt = new OutgoingPacket();
+			new_pkt = std::make_unique<OutgoingPacket>();
+			pkt = new_pkt.get();
 			pkt->data.resize(header_size + added);
 			pkt->payload = 0;
 			pkt->transmissions = 0;
@@ -829,7 +708,7 @@ void UtpSocket::write_outgoing_packet(size_t payload, uint flags, struct utp_iov
 
 		if (append) {
 			send_.outbuf.ensure_size(send_.seq_nr, send_.cur_window_packets);
-			send_.outbuf.put(send_.seq_nr, pkt);
+			send_.outbuf.put(send_.seq_nr, std::move(new_pkt));
 			p1->seq_nr = send_.seq_nr;
 			send_.seq_nr++;
 			send_.cur_window_packets++;
@@ -860,7 +739,7 @@ void UtpSocket::check_invariant()
 
 	size_t outstanding_bytes = 0;
 	for (int i = 0; i < send_.cur_window_packets; ++i) {
-		OutgoingPacket *pkt = (OutgoingPacket*)send_.outbuf.get(send_.seq_nr - i - 1);
+		OutgoingPacket *pkt = send_.outbuf.get(send_.seq_nr - i - 1);
 		if (pkt == 0 || pkt->transmissions == 0 || pkt->need_resend) continue;
 		outstanding_bytes += pkt->payload;
 	}
@@ -948,7 +827,7 @@ void UtpSocket::check_timeouts()
 				cc_->on_rto_timeout(conn_.host->current_ms(), (size_t)packet_size, send_.cur_window_packets);
 			}
 			for (int i = 0; i < send_.cur_window_packets; ++i) {
-				OutgoingPacket *pkt = (OutgoingPacket*)send_.outbuf.get(send_.seq_nr - i - 1);
+				OutgoingPacket *pkt = send_.outbuf.get(send_.seq_nr - i - 1);
 				if (pkt == 0 || pkt->transmissions == 0 || pkt->need_resend) continue;
 				pkt->need_resend = true;
 				cc_->remove_in_flight(pkt->payload);
@@ -963,7 +842,7 @@ void UtpSocket::check_timeouts()
 				timing_.fast_timeout_ = true;
 				timing_.timeout_seq_nr = send_.seq_nr;
 
-				OutgoingPacket *pkt = (OutgoingPacket*)send_.outbuf.get(send_.seq_nr - send_.cur_window_packets);
+				OutgoingPacket *pkt = send_.outbuf.get(send_.seq_nr - send_.cur_window_packets);
 				assert(pkt);
 				send_packet(pkt);
 			}
@@ -1008,7 +887,7 @@ void UtpSocket::check_timeouts()
 // -----------------------------------------------------------------------------
 int UtpSocket::ack_packet(uint16 seq)
 {
-	OutgoingPacket *pkt = (OutgoingPacket*)send_.outbuf.get(seq);
+	OutgoingPacket *pkt = send_.outbuf.get(seq);
 
 	if (pkt == NULL) {
 
@@ -1034,7 +913,8 @@ int UtpSocket::ack_packet(uint16 seq)
 		seq, (uint)pkt->payload, pkt->need_resend);
 	#endif
 
-	send_.outbuf.put(seq, nullptr);
+	// 取走所有权：函数返回时自动释放（取代原先的 put(nullptr) + delete）
+	std::unique_ptr<OutgoingPacket> owned = send_.outbuf.take(seq);
 
 	if (pkt->transmissions == 1) {
 		const uint32 ertt = (uint32)((utp_call_get_microseconds(this->conn_.host->handle(), this) - pkt->time_sent) / 1000);
@@ -1052,7 +932,6 @@ int UtpSocket::ack_packet(uint16 seq)
 	if (!pkt->need_resend) {
 		cc_->remove_in_flight(pkt->payload);
 	}
-	delete pkt;
 	cc_->set_retransmit_count(0);
 	return 0;
 }
@@ -1090,11 +969,13 @@ size_t UtpSocket::selective_ack_bytes(uint base, const byte* mask, byte len, int
 		if (((send_.seq_nr - v - 1) & ACK_NR_MASK) >= (uint16)(send_.cur_window_packets - 1))
 			continue;
 
-		OutgoingPacket *pkt = (OutgoingPacket*)send_.outbuf.get(v);
+		OutgoingPacket *pkt = send_.outbuf.get(v);
 		if (!pkt || pkt->transmissions == 0)
 			continue;
 
-		if (bits >= 0 && mask[bits>>3] & (1 << (bits & 7))) {
+		// 上界检查：循环从 bits == len*8 开始（位图外一位，语义为“未确认”），
+		// 该位不存在于 mask 中，直接按未置位处理；否则会越界读 mask[len]
+		if (bits >= 0 && bits < (int)len * 8 && mask[bits>>3] & (1 << (bits & 7))) {
 			assert((int)(pkt->payload) >= 0);
 			acked_bytes += pkt->payload;
 			if (pkt->time_sent < now)
@@ -1159,7 +1040,7 @@ void UtpSocket::selective_ack(uint base, const byte *mask, byte len)
 
 		if (bit_set) count++;
 
-		OutgoingPacket *pkt = (OutgoingPacket*)send_.outbuf.get(v);
+		OutgoingPacket *pkt = send_.outbuf.get(v);
 		if (!pkt || pkt->transmissions == 0) {
 
 			#if UTP_DEBUG_LOGGING
@@ -1215,7 +1096,7 @@ void UtpSocket::selective_ack(uint base, const byte *mask, byte len)
 	int i = 0;
 	while (nr > 0) {
 		uint v = resends[--nr];
-		OutgoingPacket *pkt = (OutgoingPacket*)send_.outbuf.get(v);
+		OutgoingPacket *pkt = send_.outbuf.get(v);
 
 		if (!pkt) continue;
 
@@ -1300,10 +1181,370 @@ UtpSocket::~UtpSocket()
 
 	remove_from_ack_list();
 
-	for (size_t i = 0; i < recv_.inbuf.buf_size(); i++) {
-		delete (InboundPacket*)recv_.inbuf.element(i);
+	// inbuf/outbuf 持有 unique_ptr，析构时自动释放全部包对象
+}
+
+// =============================================================================
+// 以下为面向 C API 的 UtpSocket 公开操作实现（原位于 utp_api.cpp，已归位）。
+// utp_api.cpp 中对应的 utp_* 函数只做空指针检查后 1 行委托到这里。
+// =============================================================================
+
+// 初始化 uTP socket 的内部状态（状态机、连接 ID、计时器、拥塞控制、MTU 等）。
+// 这是所有 uTP socket 公共入口（utp_connect、utp_accept、utp_create_socket）的共同底层。
+// 参数 addr - 对端地址
+// 参数 addrlen - 对端地址长度
+// 参数 need_seed_gen - 是否需要重新生成连接种子和连接 ID
+//                     （主动 connect 时为 true，服务端接受时为 false）
+// 参数 seed - 连接种子；need_seed_gen 为 true 时被本函数覆写
+// 参数 id_recv - 接收方向连接 ID；need_seed_gen 为 true 时被本函数覆写
+// 参数 id_send - 发送方向连接 ID；need_seed_gen 为 true 时被本函数覆写
+void UtpSocket::initialize(	const struct sockaddr *addr,
+							socklen_t addrlen,
+							bool need_seed_gen,
+							uint32 seed,
+							uint32 id_recv,
+							uint32 id_send)
+{
+	utp::Address psaddr = utp::Address((const SOCKADDR_STORAGE*)addr, addrlen);
+
+	if (need_seed_gen) {
+		do {
+			seed = utp_call_get_random(conn_.host->handle(), this);
+			seed &= 0xffff;
+		} while (conn_.host->has_socket(psaddr, seed));
+
+		id_recv += seed;
+		id_send += seed;
 	}
- 	for (size_t i = 0; i < send_.outbuf.buf_size(); i++) {
-		delete (OutgoingPacket*)send_.outbuf.element(i);
+
+	conn_.state						= CS_IDLE;
+	conn_.conn_seed					= seed;
+	conn_.conn_id_recv				= id_recv;
+	conn_.conn_id_send				= id_send;
+	conn_.addr					= psaddr;
+	conn_.host->refresh_clock(nullptr);
+	timing_.last_got_packet			= conn_.host->current_ms();
+	timing_.last_sent_packet			= conn_.host->current_ms();
+	timing_.last_measured_delay		= conn_.host->current_ms() + 0x70000000;
+	cc_->init_timing(conn_.host->current_ms());
+	cc_->init_delay_histories(conn_.host->current_ms());
+
+	mtu_.reset((uint32)get_udp_mtu(), conn_.host->current_ms());
+	mtu_.set_last_to_ceiling();
+
+	conn_.host->register_socket(this);
+
+	cc_->set_max_window(get_packet_size());
+
+	#if UTP_DEBUG_LOGGING
+	log(UTP_LOG_DEBUG, "UTP socket initialized");
+	#endif
+}
+
+// 主动发起一次 uTP 连接（发送 SYN）。
+// 调用后 socket 状态由 CS_UNINITIALIZED 转为 CS_SYN_SENT，
+// 收到 SYN-ACK 后通过 UTP_STATE_CONNECT 事件回调通知用户。
+// 参数 to - 对端地址
+// 参数 tolen - 对端地址长度
+// 返回: 0 表示成功发起；-1 表示 socket 已处于非初始状态
+int UtpSocket::connect(const struct sockaddr *to, socklen_t tolen)
+{
+	assert(conn_.state == CS_UNINITIALIZED);
+	if (conn_.state != CS_UNINITIALIZED) {
+		conn_.state = CS_DESTROY;
+		return -1;
 	}
+
+	initialize(to, tolen, true, 0, 0, 1);
+
+	assert(send_.cur_window_packets == 0);
+	assert(send_.outbuf.get(send_.seq_nr) == NULL);
+	assert(sizeof(PacketFormatV1) == 20);
+
+	conn_.state = CS_SYN_SENT;
+	conn_.host->refresh_clock(this);
+
+	log(UTP_LOG_NORMAL, "UTP_Connect conn_seed_:%u packet_size:%u (B) "
+			"target_delay_:%u (ms) delay_history:%u "
+			"delay_base_history:%u (minutes)",
+			conn_.conn_seed, PACKET_SIZE, conn_.target_delay / 1000,
+			CUR_DELAY_SIZE, DELAY_BASE_HISTORY);
+
+	cc_->set_retransmit_timeout(3000);
+	cc_->set_rto_timeout(conn_.host->current_ms() + cc_->retransmit_timeout());
+	recv_.last_rcv_win = get_rcv_window();
+
+	send_.seq_nr = utp_call_get_random(conn_.host->handle(), this);
+
+	const size_t header_size = sizeof(PacketFormatV1);
+
+	auto syn_pkt = std::make_unique<OutgoingPacket>();
+	OutgoingPacket *pkt = syn_pkt.get();
+	pkt->data.resize(header_size);
+	PacketFormatV1* p1 = (PacketFormatV1*)pkt->data.data();
+
+	memset(p1, 0, header_size);
+	p1->set_version(1);
+	p1->set_type(ST_SYN);
+	p1->ext = 0;
+	p1->connid = conn_.conn_id_recv;
+	p1->windowsize = (uint32)recv_.last_rcv_win;
+	p1->seq_nr = send_.seq_nr;
+	pkt->transmissions = 0;
+	pkt->length = header_size;
+	pkt->payload = 0;
+
+	send_.outbuf.ensure_size(send_.seq_nr, send_.cur_window_packets);
+	send_.outbuf.put(send_.seq_nr, std::move(syn_pkt));
+	send_.seq_nr++;
+	send_.cur_window_packets++;
+
+	#if UTP_DEBUG_LOGGING
+	log(UTP_LOG_DEBUG, "incrementing cur_window_packets_:%u", send_.cur_window_packets);
+	#endif
+
+	send_packet(pkt);
+	return 0;
+}
+
+// 设置单个 uTP socket 级别的选项。
+// 支持的选项：UTP_SNDBUF/UTP_RCVBUF/UTP_TARGET_DELAY。
+// 必须在 socket 处于 CS_CONNECTED 之前调用以避免与并发传输冲突。
+// 返回: 0 表示成功，-1 表示 opt 未知
+int UtpSocket::set_option(int opt, int val)
+{
+	switch (opt) {
+
+	case UTP_SNDBUF:
+		assert(val >= 1);
+		send_.opt_sndbuf = val;
+		return 0;
+
+	case UTP_RCVBUF:
+		assert(val >= 1);
+		recv_.opt_rcvbuf = val;
+		return 0;
+
+	case UTP_TARGET_DELAY:
+		conn_.target_delay = val;
+		return 0;
+	}
+
+	return -1;
+}
+
+// 获取单个 uTP socket 级别选项的当前值。
+// 返回: 选项当前值；opt 未知时返回 -1
+int UtpSocket::get_option(int opt)
+{
+	switch (opt) {
+		case UTP_SNDBUF:		return send_.opt_sndbuf;
+		case UTP_RCVBUF:		return recv_.opt_rcvbuf;
+		case UTP_TARGET_DELAY:	return conn_.target_delay;
+	}
+
+	return -1;
+}
+
+// -----------------------------------------------------------------------------
+// 函数：UtpSocket::writev
+// 功能：使用 scatter/gather I/O 向 uTP 连接写入多段不连续数据。
+//
+// 参数：
+//   iovec_input  - iovec 数组，每项包含缓冲区地址和长度
+//   num_iovecs   - iovec 数组长度（上限 UTP_IOV_MAX）
+//
+// 返回值：
+//   成功入队的总字节数；socket 未连接或已发送 FIN 时返回 0
+// -----------------------------------------------------------------------------
+ssize_t UtpSocket::writev(struct utp_iovec *iovec_input, size_t num_iovecs)
+{
+	static utp_iovec iovec[UTP_IOV_MAX];
+
+	if (num_iovecs > UTP_IOV_MAX)
+		num_iovecs = UTP_IOV_MAX;
+
+	memcpy(iovec, iovec_input, sizeof(struct utp_iovec)*num_iovecs);
+
+	size_t bytes = 0;
+	size_t sent = 0;
+	for (size_t i = 0; i < num_iovecs; i++)
+		bytes += iovec[i].iov_len;
+
+	#if UTP_DEBUG_LOGGING
+	size_t param = bytes;
+	#endif
+
+	if (!fsm().writable()) {
+		#if UTP_DEBUG_LOGGING
+		log(UTP_LOG_DEBUG, "UTP_Write %u bytes = false (not CS_CONNECTED)", (uint)bytes);
+		#endif
+		return 0;
+	}
+
+	if (send_.fin_sent) {
+		#if UTP_DEBUG_LOGGING
+		log(UTP_LOG_DEBUG, "UTP_Write %u bytes = false (fin_sent already)", (uint)bytes);
+		#endif
+		return 0;
+	}
+
+	conn_.host->refresh_clock(this);
+
+	size_t packet_size = get_packet_size();
+	size_t num_to_send = min<size_t>(bytes, packet_size);
+	while (!is_full(num_to_send)) {
+		bytes -= num_to_send;
+		sent  += num_to_send;
+
+		#if UTP_DEBUG_LOGGING
+		log(UTP_LOG_DEBUG, "Sending packet. seq_nr_:%u ack_nr_:%u wnd:%u/%u/%u rcv_win:%u size:%u cur_window_packets_:%u",
+			send_.seq_nr, recv_.ack_nr,
+			(uint)(cc_->cur_window() + num_to_send),
+			(uint)cc_->max_window(), (uint)send_.max_window_user,
+			(uint)recv_.last_rcv_win, num_to_send,
+			send_.cur_window_packets);
+		#endif
+		write_outgoing_packet(num_to_send, ST_DATA, iovec, num_iovecs);
+		num_to_send = min<size_t>(bytes, packet_size);
+
+		if (num_to_send == 0) {
+			#if UTP_DEBUG_LOGGING
+			log(UTP_LOG_DEBUG, "UTP_Write %u bytes = true", (uint)param);
+			#endif
+			return sent;
+		}
+	}
+
+	bool full = is_full();
+	if (full) {
+		conn_.state = CS_CONNECTED_FULL;
+	}
+
+	#if UTP_DEBUG_LOGGING
+	log(UTP_LOG_DEBUG, "UTP_Write %u bytes = %s", (uint)bytes, full ? "false" : "true");
+	#endif
+
+	return sent;
+}
+
+// -----------------------------------------------------------------------------
+// 函数：UtpSocket::read_drained
+// 功能：通知库应用已消费完数据，释放接收缓冲区。
+// -----------------------------------------------------------------------------
+void UtpSocket::read_drained()
+{
+	assert(conn_.state != CS_UNINITIALIZED);
+	if (conn_.state == CS_UNINITIALIZED) return;
+
+	const size_t rcvwin = get_rcv_window();
+
+	if (rcvwin > recv_.last_rcv_win) {
+		if (recv_.last_rcv_win == 0) {
+			send_ack();
+		} else {
+			conn_.host->refresh_clock(this);
+			schedule_ack();
+		}
+	}
+}
+
+// -----------------------------------------------------------------------------
+// 函数：UtpSocket::get_peername
+// 功能：获取对端地址。
+//
+// 参数：
+//   addr_out - 输出缓冲区，用于存储对端地址
+//   addrlen  - 输入/输出参数，传入 addr 缓冲区大小，返回实际地址长度
+//
+// 返回值：
+//   0 表示成功；-1 表示 socket 未初始化
+// -----------------------------------------------------------------------------
+int UtpSocket::get_peername(struct sockaddr *addr_out, socklen_t *addrlen)
+{
+	assert(conn_.state != CS_UNINITIALIZED);
+	if (conn_.state == CS_UNINITIALIZED) return -1;
+
+	socklen_t len;
+	const SOCKADDR_STORAGE sa = conn_.addr.get_sockaddr_storage(&len);
+	*addrlen = min(len, *addrlen);
+	memcpy(addr_out, &sa, *addrlen);
+	return 0;
+}
+
+// -----------------------------------------------------------------------------
+// 函数：UtpSocket::get_delays
+// 功能：获取延迟测量值。
+//
+// 参数：
+//   ours   - 输出参数，本端到对端的延迟（毫秒），可为 NULL
+//   theirs - 输出参数，对端到本端的延迟（毫秒），可为 NULL
+//   age    - 输出参数，距离上次测量延迟的时间（毫秒），可为 NULL
+//
+// 返回值：
+//   0 表示成功；-1 表示 socket 未初始化
+// -----------------------------------------------------------------------------
+int UtpSocket::get_delays(uint32 *ours, uint32 *theirs, uint32 *age)
+{
+	assert(conn_.state != CS_UNINITIALIZED);
+	if (conn_.state == CS_UNINITIALIZED) {
+		if (ours)   *ours   = 0;
+		if (theirs) *theirs = 0;
+		if (age)    *age    = 0;
+		return -1;
+	}
+
+	if (ours)   *ours   = cc_->our_hist().get_value();
+	if (theirs) *theirs = cc_->their_hist().get_value();
+	if (age)    *age    = (uint32)(conn_.host->current_ms() - timing_.last_measured_delay);
+	return 0;
+}
+
+// -----------------------------------------------------------------------------
+// 函数：UtpSocket::close
+// 功能：关闭 socket。行为按当前状态多态分派（State 模式）。
+// -----------------------------------------------------------------------------
+void UtpSocket::close()
+{
+	assert(conn_.state != CS_UNINITIALIZED
+		&& conn_.state != CS_DESTROY);
+
+	#if UTP_DEBUG_LOGGING
+	log(UTP_LOG_DEBUG, "UTP_Close in state:%s", fsm().name());
+	#endif
+
+	// 行为按当前状态多态分派（State 模式）
+	fsm().close(*this);
+
+	#if UTP_DEBUG_LOGGING
+	log(UTP_LOG_DEBUG, "UTP_Close end in state:%s", fsm().name());
+	#endif
+}
+
+// -----------------------------------------------------------------------------
+// 函数：UtpSocket::shutdown
+// 功能：关闭 socket 方向（SHUT_RD 关闭读、SHUT_WR 关闭写）。
+// -----------------------------------------------------------------------------
+void UtpSocket::shutdown(int how)
+{
+	assert(conn_.state != CS_UNINITIALIZED
+		&& conn_.state != CS_DESTROY);
+
+	#if UTP_DEBUG_LOGGING
+	log(UTP_LOG_DEBUG, "UTP_shutdown(%d) in state:%s", how, fsm().name());
+	#endif
+
+	// 行为按当前状态多态分派（State 模式）
+	fsm().shutdown(*this, how);
+}
+
+// 获取 socket 统计信息（仅 _DEBUG 编译时有效，否则返回 NULL）
+utp_socket_stats* UtpSocket::get_stats()
+{
+	#ifdef _DEBUG
+		stats_.mtu_guess = mtu_.raw_mtu();
+		return &stats_;
+	#else
+		return NULL;
+	#endif
 }

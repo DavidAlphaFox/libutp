@@ -121,7 +121,7 @@ struct ReceiveState {
 	bool read_shutdown : 1 = false;    // 读端是否已关闭
 	size_t opt_rcvbuf = 0;          // 接收缓冲区大小
 	size_t last_rcv_win = 0;        // 最后通告的接收窗口大小
-	utp::RawSequenceBuffer inbuf;   // 入站序列缓冲区
+	utp::SequenceBuffer<InboundPacket> inbuf;   // 入站序列缓冲区
 };
 
 // 发送侧状态
@@ -133,7 +133,7 @@ struct SendState {
 	bool close_requested_ : 1 = false;  // 用户是否请求关闭连接
 	size_t opt_sndbuf = 0;          // 发送缓冲区大小
 	size_t max_window_user = 0;     // 用户设定的最大发送窗口
-	utp::RawSequenceBuffer outbuf;  // 出站序列缓冲区
+	utp::SequenceBuffer<OutgoingPacket> outbuf;  // 出站序列缓冲区
 };
 
 // 超时 / 延迟测量状态
@@ -167,7 +167,7 @@ public:
 		vsnprintf(buf, 4096, fmt, va);
 		buf[4095] = '\0';
 
-		snprintf(buf2, 4096, "%p %s %06u %s", static_cast<void*>(this), addrfmt(conn_.addr, addrbuf), conn_.conn_id_recv, buf);
+		snprintf(buf2, 4096, "%p %s %06u %s", static_cast<void*>(this), addrfmt(conn_.addr), conn_.conn_id_recv, buf);
 		buf2[4095] = '\0';
 
 		// 直接经回调把日志送出（已自行加好前缀，无需再过 log_unchecked）
