@@ -23,6 +23,13 @@ option(UTP_BUILD_SHARED     "构建动态库而非静态库" OFF)
 option(UTP_BUILD_EXAMPLES   "构建示例程序（ucat）"         ON)
 option(UTP_DEBUG_LOGGING    "启用详细调试日志"          OFF)
 option(UTP_ENABLE_STATS     "启用 utp_get_stats() 和额外检查" OFF)
+option(UTP_SANITIZE         "启用 AddressSanitizer + UBSan（作用于全部目标）" OFF)
+
+# ── Sanitizers ────────────────────────────────────────────
+if(UTP_SANITIZE)
+    add_compile_options(-fsanitize=address,undefined -fno-omit-frame-pointer)
+    add_link_options(-fsanitize=address,undefined)
+endif()
 
 # ── 库 ───────────────────────────────────────────────────
 add_subdirectory(src)
