@@ -52,3 +52,27 @@ jobs:
           sleep 1
           kill $SRV 2>/dev/null || true
           cmp in.bin out.bin
+
+  fuzz-smoke:
+    name: Fuzz (libFuzzer, 60s)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Clang runtime
+        run: sudo apt-get update && sudo apt-get install -y clang libclang-rt-dev
+
+      - name: Configure
+        run: >
+          cmake -S . -B build
+          -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++
+          -DCMAKE_BUILD_TYPE=Debug -DUTP_BUILD_FUZZERS=ON -DUTP_SANITIZE=ON
+          -DBUILD_TESTING=OFF -DUTP_BUILD_EXAMPLES=OFF
+
+      - name: Build
+        run: cmake --build build -j$(nproc)
+
+      - name: Run fuzzer (60s smoke)
+        run: |
+          mkdir -p corpus
+          ./build/fuzz/fuzz_process_udp -max_total_time=60 -print_final_stats=1 corpus
