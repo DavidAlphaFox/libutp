@@ -27,35 +27,53 @@
 // 它通过在常规数据包中嵌入探测包来探测路径最大传输单元,
 // 使用二分搜索逐步逼近真实 MTU 值。
 //
-// 调用方向: UtpSocket → MtuDiscovery (单向)
-// MtuDiscovery 不持有 UtpSocket 的完整引用, 仅保存指针用于日志记录。
-//
-// 实现细节: 需要 owner_->log() 的方法 (reset/search_update/handle_*)
-// 在 utp_internal.cpp 中定义 (位于 UtpSocket 完整定义之后),
-// 因为本头文件被包含在 UtpSocket 定义之前, 此时 UtpSocket 是不完整类型。
-// 不调用 owner_->log() 的简单方法 (访问器、set_probe、clear_probe 等) 仍
-// 保持 inline, 充分利用 header-only 的优势。
+// 解耦: MtuDiscovery 只依赖 utp::ILogger 这个窄接口(用于 MTU 日志),
+// 不再持有 UtpSocket 的指针。因此本类完全自包含、可 header-only 内联,
+// 也可在单元测试中接入一个假的 ILogger 独立测试。
 
+#include <algorithm>
 #include <cassert>
 #include <cstddef>
 #include <cstdint>
 
 #include "utp.h"
-
-// UtpSocket 的完整定义位于 utp_internal.cpp,
-// MtuDiscovery 仅持有非拥有指针并通过该指针调用 UtpSocket::log()。
-class UtpSocket;
+#include "utp/logger.hpp"
 
 class MtuDiscovery {
 public:
-	explicit MtuDiscovery(UtpSocket* owner)
-		: owner_(owner) {}
+	explicit MtuDiscovery(utp::ILogger* logger)
+		: logger_(logger) {}
 
 	// 重置 MTU 搜索范围, 通常在初始化或定时重置时调用。
-	void reset(uint32 udp_mtu, uint64 current_ms);
+	//   1. ceiling 设为当前 UDP MTU; 2. floor 设为 576 (IPv4 最小重组缓冲);
+	//   3. 下次探测时间设为 30 分钟后。
+	void reset(uint32 udp_mtu, uint64 current_ms) {
+		mtu_ceiling_ = udp_mtu;
+		mtu_floor_ = 576;
+		logger_->log(UTP_LOG_MTU, "MTU [RESET] floor:%d ceiling:%d current:%d"
+			, mtu_floor_, mtu_ceiling_, mtu_last_);
+		assert(mtu_floor_ <= mtu_ceiling_);
+		mtu_discover_time_ = current_ms + 30 * 60 * 1000;
+	}
 
-	// 推进二分搜索 (在 floor/ceiling 变更后调用)。
-	void search_update(uint64 current_ms);
+	// 推进二分搜索 (在 floor/ceiling 变更后调用): last 取中点; 清除探测;
+	// 当 ceiling-floor<=16 视为完成, last=ceiling=floor 并安排下次重发现。
+	void search_update(uint64 current_ms) {
+		assert(mtu_floor_ <= mtu_ceiling_);
+
+		mtu_last_ = (mtu_floor_ + mtu_ceiling_) / 2;
+
+		mtu_probe_seq_ = mtu_probe_size_ = 0;
+
+		if (mtu_ceiling_ - mtu_floor_ <= 16) {
+			mtu_last_ = mtu_floor_;
+			logger_->log(UTP_LOG_MTU, "MTU [DONE] floor:%d ceiling:%d current:%d"
+				, mtu_floor_, mtu_ceiling_, mtu_last_);
+			mtu_ceiling_ = mtu_floor_;
+			assert(mtu_floor_ <= mtu_ceiling_);
+			mtu_discover_time_ = current_ms + 30 * 60 * 1000;
+		}
+	}
 
 	// 返回有效载荷 MTU (扣除报文头)
 	size_t effective_mtu(size_t header_size) const {
@@ -78,21 +96,48 @@ public:
 		return mtu_probe_seq_ != 0 && seq == mtu_probe_seq_;
 	}
 
-	// 探测包被确认, 提升 floor 并推进二分搜索。
+	// 探测包被确认: 提升 floor 到探测大小并推进二分搜索。
 	// 返回 true 表示处理了一个探测 ACK。
-	bool handle_probe_ack(uint32 seq, uint64 current_ms);
+	bool handle_probe_ack(uint32 seq, uint64 current_ms) {
+		if (is_probe(seq)) {
+			mtu_floor_ = mtu_probe_size_;
+			search_update(current_ms);
+			return true;
+		}
+		return false;
+	}
 
-	// 探测包超时 (RTO 触发): 若在飞包仅一个且为探测, 则收紧 ceiling。
-	bool handle_probe_timeout(uint32 outstanding_seq, uint32 cur_window_packets, uint64 current_ms);
+	// 探测包超时 (RTO 触发): 若在飞包仅一个且为探测, 则收紧 ceiling 并忽略丢包。
+	bool handle_probe_timeout(uint32 outstanding_seq, uint32 cur_window_packets, uint64 current_ms) {
+		bool ignore_loss = false;
+		if (cur_window_packets == 1 && is_probe(outstanding_seq)) {
+			mtu_ceiling_ = mtu_probe_size_ - 1;
+			search_update(current_ms);
+			ignore_loss = true;
+		}
+		clear_probe();
+		return ignore_loss;
+	}
 
-	// 处理探测包被视为"丢失"的通用路径 (DUPACK 等场景)。
-	void handle_probe_loss(uint64 current_ms);
+	// 处理探测包被视为"丢失"的通用路径 (DUPACK 等场景): 收紧 ceiling 并推进搜索。
+	void handle_probe_loss(uint64 current_ms) {
+		mtu_ceiling_ = mtu_probe_size_ - 1;
+		search_update(current_ms);
+		clear_probe();
+	}
 
 	// ICMP need-frag: 用 next_hop_mtu 收紧 ceiling 并直接采纳为当前 MTU。
-	void handle_icmp_fragmentation(uint16 next_hop_mtu, uint64 current_ms);
+	void handle_icmp_fragmentation(uint16 next_hop_mtu, uint64 current_ms) {
+		mtu_ceiling_ = std::min<uint32>(next_hop_mtu, mtu_ceiling_);
+		search_update(current_ms);
+		mtu_last_ = mtu_ceiling_;
+	}
 
 	// ICMP 无有效 next_hop_mtu: 走标准二分, 取中点作为新 ceiling。
-	void handle_icmp_unknown(uint64 current_ms);
+	void handle_icmp_unknown(uint64 current_ms) {
+		mtu_ceiling_ = (mtu_floor_ + mtu_ceiling_) / 2;
+		search_update(current_ms);
+	}
 
 	// 检查是否到了重置搜索的截止时间
 	bool should_rediscover(uint64 current_ms) const {
@@ -117,7 +162,7 @@ public:
 	uint32 probe_size() const  { return mtu_probe_size_; }
 
 private:
-	UtpSocket* owner_;
+	utp::ILogger* logger_;          // 仅用于 MTU 日志的窄依赖(非拥有)
 	uint64 mtu_discover_time_ = 0;  // 下一次重置搜索的时间
 	uint32 mtu_ceiling_ = 0;        // 二分搜索上界
 	uint32 mtu_floor_ = 0;          // 二分搜索下界

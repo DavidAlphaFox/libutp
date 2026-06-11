@@ -406,9 +406,9 @@ void UtpSocket::initialize(	const struct sockaddr *addr,
 
 	if (need_seed_gen) {
 		do {
-			seed = utp_call_get_random(conn_.ctx, this);
+			seed = utp_call_get_random(conn_.host->handle(), this);
 			seed &= 0xffff;
-		} while (conn_.ctx->sockets_.count(UtpSocketKey(psaddr, seed)));
+		} while (conn_.host->has_socket(psaddr, seed));
 
 		id_recv += seed;
 		id_send += seed;
@@ -419,19 +419,19 @@ void UtpSocket::initialize(	const struct sockaddr *addr,
 	conn_.conn_id_recv				= id_recv;
 	conn_.conn_id_send				= id_send;
 	conn_.addr					= psaddr;
-	conn_.ctx->current_ms_			= utp_call_get_milliseconds(conn_.ctx, NULL);
-	timing_.last_got_packet			= conn_.ctx->current_ms_;
-	timing_.last_sent_packet			= conn_.ctx->current_ms_;
-	timing_.last_measured_delay		= conn_.ctx->current_ms_ + 0x70000000;
-	cc_.init_timing(conn_.ctx->current_ms_);
-	cc_.init_delay_histories(conn_.ctx->current_ms_);
+	conn_.host->refresh_clock(nullptr);
+	timing_.last_got_packet			= conn_.host->current_ms();
+	timing_.last_sent_packet			= conn_.host->current_ms();
+	timing_.last_measured_delay		= conn_.host->current_ms() + 0x70000000;
+	cc_->init_timing(conn_.host->current_ms());
+	cc_->init_delay_histories(conn_.host->current_ms());
 
-	mtu_.reset((uint32)get_udp_mtu(), conn_.ctx->current_ms_);
+	mtu_.reset((uint32)get_udp_mtu(), conn_.host->current_ms());
 	mtu_.set_last_to_ceiling();
 
-	conn_.ctx->sockets_[UtpSocketKey(conn_.addr, conn_.conn_id_recv)] = this;
+	conn_.host->register_socket(this);
 
-	cc_.set_max_window(get_packet_size());
+	cc_->set_max_window(get_packet_size());
 
 	#if UTP_DEBUG_LOGGING
 	log(UTP_LOG_DEBUG, "UTP socket initialized");
@@ -444,8 +444,9 @@ void UtpSocket::initialize(	const struct sockaddr *addr,
 // 返回: 新创建的 socket 指针
 UtpSocket* UtpContext::create_socket()
 {
+	// 构造后 send_.seq_nr 与 timing_.fast_resend_seq_nr 均为默认值 1（NSDMI 已同步）；
+	// connect()/accept_syn() 会在随机化 seq_nr 时重新对齐二者。
 	UtpSocket *conn = new UtpSocket(this);
-	conn->timing_.fast_resend_seq_nr = conn->send_.seq_nr;
 	return conn;
 }
 
@@ -607,7 +608,7 @@ int UtpSocket::connect(const struct sockaddr *to, socklen_t tolen)
 	assert(sizeof(PacketFormatV1) == 20);
 
 	conn_.state = CS_SYN_SENT;
-	conn_.ctx->current_ms_ = utp_call_get_milliseconds(conn_.ctx, this);
+	conn_.host->refresh_clock(this);
 
 	log(UTP_LOG_NORMAL, "UTP_Connect conn_seed_:%u packet_size:%u (B) "
 			"target_delay_:%u (ms) delay_history:%u "
@@ -615,11 +616,11 @@ int UtpSocket::connect(const struct sockaddr *to, socklen_t tolen)
 			conn_.conn_seed, PACKET_SIZE, conn_.target_delay / 1000,
 			CUR_DELAY_SIZE, DELAY_BASE_HISTORY);
 
-	cc_.set_retransmit_timeout(3000);
-	cc_.set_rto_timeout(conn_.ctx->current_ms_ + cc_.retransmit_timeout());
+	cc_->set_retransmit_timeout(3000);
+	cc_->set_rto_timeout(conn_.host->current_ms() + cc_->retransmit_timeout());
 	recv_.last_rcv_win = get_rcv_window();
 
-	send_.seq_nr = utp_call_get_random(conn_.ctx, this);
+	send_.seq_nr = utp_call_get_random(conn_.host->handle(), this);
 
 	const size_t header_size = sizeof(PacketFormatV1);
 
@@ -701,7 +702,7 @@ ssize_t UtpSocket::writev(struct utp_iovec *iovec_input, size_t num_iovecs)
 	size_t param = bytes;
 	#endif
 
-	if (conn_.state != CS_CONNECTED) {
+	if (!fsm().writable()) {
 		#if UTP_DEBUG_LOGGING
 		log(UTP_LOG_DEBUG, "UTP_Write %u bytes = false (not CS_CONNECTED)", (uint)bytes);
 		#endif
@@ -715,7 +716,7 @@ ssize_t UtpSocket::writev(struct utp_iovec *iovec_input, size_t num_iovecs)
 		return 0;
 	}
 
-	conn_.ctx->current_ms_ = utp_call_get_milliseconds(conn_.ctx, this);
+	conn_.host->refresh_clock(this);
 
 	size_t packet_size = get_packet_size();
 	size_t num_to_send = min<size_t>(bytes, packet_size);
@@ -726,8 +727,8 @@ ssize_t UtpSocket::writev(struct utp_iovec *iovec_input, size_t num_iovecs)
 		#if UTP_DEBUG_LOGGING
 		log(UTP_LOG_DEBUG, "Sending packet. seq_nr_:%u ack_nr_:%u wnd:%u/%u/%u rcv_win:%u size:%u cur_window_packets_:%u",
 			send_.seq_nr, recv_.ack_nr,
-			(uint)(cc_.cur_window() + num_to_send),
-			(uint)cc_.max_window(), (uint)send_.max_window_user,
+			(uint)(cc_->cur_window() + num_to_send),
+			(uint)cc_->max_window(), (uint)send_.max_window_user,
 			(uint)recv_.last_rcv_win, num_to_send,
 			send_.cur_window_packets);
 		#endif
@@ -774,7 +775,7 @@ void UtpSocket::read_drained()
 		if (recv_.last_rcv_win == 0) {
 			send_ack();
 		} else {
-			conn_.ctx->current_ms_ = utp_call_get_milliseconds(conn_.ctx, this);
+			conn_.host->refresh_clock(this);
 			schedule_ack();
 		}
 	}
@@ -846,7 +847,7 @@ void UtpContext::check_timeouts()
 	for (auto* conn : sockets) {
 		conn->check_timeouts();
 
-		if (conn->conn_.state == CS_DESTROY) {
+		if (conn->state() == CS_DESTROY) {
 			#if UTP_DEBUG_LOGGING
 			conn->log(UTP_LOG_DEBUG, "Destroying");
 			#endif
@@ -929,9 +930,9 @@ int UtpSocket::get_delays(uint32 *ours, uint32 *theirs, uint32 *age)
 		return -1;
 	}
 
-	if (ours)   *ours   = cc_.our_hist().get_value();
-	if (theirs) *theirs = cc_.their_hist().get_value();
-	if (age)    *age    = (uint32)(conn_.ctx->current_ms_ - timing_.last_measured_delay);
+	if (ours)   *ours   = cc_->our_hist().get_value();
+	if (theirs) *theirs = cc_->their_hist().get_value();
+	if (age)    *age    = (uint32)(conn_.host->current_ms() - timing_.last_measured_delay);
 	return 0;
 }
 
@@ -950,32 +951,14 @@ void UtpSocket::close()
 		&& conn_.state != CS_DESTROY);
 
 	#if UTP_DEBUG_LOGGING
-	log(UTP_LOG_DEBUG, "UTP_Close in state:%s", statenames[conn_.state]);
+	log(UTP_LOG_DEBUG, "UTP_Close in state:%s", fsm().name());
 	#endif
 
-	switch(conn_.state) {
-	case CS_CONNECTED:
-	case CS_CONNECTED_FULL:
-		recv_.read_shutdown = true;
-		send_.close_requested_ = true;
-		if (!send_.fin_sent) {
-			send_.fin_sent = true;
-			write_outgoing_packet(0, ST_FIN, NULL, 0);
-		} else if (send_.fin_sent_acked_) {
-			conn_.state = CS_DESTROY;
-		}
-		break;
-
-	case CS_SYN_SENT:
-		cc_.set_rto_timeout(utp_call_get_milliseconds(conn_.ctx, this) + min<uint>(cc_.rto_ms() * 2, 60));
-	case CS_SYN_RECV:
-	default:
-		conn_.state = CS_DESTROY;
-		break;
-	}
+	// 行为按当前状态多态分派（State 模式）
+	fsm().close(*this);
 
 	#if UTP_DEBUG_LOGGING
-	log(UTP_LOG_DEBUG, "UTP_Close end in state:%s", statenames[conn_.state]);
+	log(UTP_LOG_DEBUG, "UTP_Close end in state:%s", fsm().name());
 	#endif
 }
 
@@ -1001,27 +984,11 @@ void UtpSocket::shutdown(int how)
 		&& conn_.state != CS_DESTROY);
 
 	#if UTP_DEBUG_LOGGING
-	log(UTP_LOG_DEBUG, "UTP_shutdown(%d) in state:%s", how, statenames[conn_.state]);
+	log(UTP_LOG_DEBUG, "UTP_shutdown(%d) in state:%s", how, fsm().name());
 	#endif
 
-	if (how != SHUT_WR) {
-		recv_.read_shutdown = true;
-	}
-	if (how != SHUT_RD) {
-		switch(conn_.state) {
-		case CS_CONNECTED:
-		case CS_CONNECTED_FULL:
-			if (!send_.fin_sent) {
-				send_.fin_sent = true;
-				write_outgoing_packet(0, ST_FIN, NULL, 0);
-			}
-			break;
-		case CS_SYN_SENT:
-			cc_.set_rto_timeout(utp_call_get_milliseconds(conn_.ctx, this) + min<uint>(cc_.rto_ms() * 2, 60));
-		default:
-			break;
-		}
-	}
+	// 行为按当前状态多态分派（State 模式）
+	fsm().shutdown(*this, how);
 }
 
 void utp_shutdown(utp_socket *s, int how) {
@@ -1128,23 +1095,8 @@ void UtpContext::log_unchecked(utp_socket *socket, char const *fmt, ...)
 	utp_call_log(this, socket, (const byte *)buf);
 }
 
-// -----------------------------------------------------------------------------
-// 函数：UtpContext::would_log
-// 功能：检查日志级别。判断指定级别的日志是否应被输出。
-//
-// 参数：
-//   level - 日志级别（UTP_LOG_NORMAL/UTP_LOG_MTU/UTP_LOG_DEBUG）
-//
-// 返回值：
-//   true 表示该级别日志已启用；false 表示未启用
-// -----------------------------------------------------------------------------
-inline bool UtpContext::would_log(int level)
-{
-	if (level == UTP_LOG_NORMAL) return log_normal_;
-	if (level == UTP_LOG_MTU) return log_mtu_;
-	if (level == UTP_LOG_DEBUG) return log_debug_;
-	return true;
-}
+// 注：UtpContext::would_log 现为 utp_internal.h 中的内联定义
+// （供 UtpSocket::vlog 等多个翻译单元内联调用，避免跨 TU 未定义引用）。
 
 // -----------------------------------------------------------------------------
 // 函数：utp_get_stats

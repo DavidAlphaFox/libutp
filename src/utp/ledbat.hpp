@@ -47,10 +47,12 @@
 
 #include "utp_types.h"
 #include "utp/delay_history.hpp"
+#include "utp/congestion_control.hpp"
 
-class LedbatController {
+class LedbatController : public ICongestionController {
 public:
 	LedbatController() = default;
+	~LedbatController() override = default;
 
 	// -- LEDBAT 核心算法 --
 	// 根据延迟反馈调整拥塞窗口。返回 post-penalty our_delay (微秒),

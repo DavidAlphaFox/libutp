@@ -1,4 +1,50 @@
-# TASK: UtpSocket 数据分组 + 独立函数归位重构
+# 面向对象重构（接口化 + 高内聚低耦合）
+
+> **状态（2026-06-11 第三次更新）**：5 个阶段全部完成并验证（工作区待提交）。
+> 目标：进一步面向对象（继承/设计模式）+ 每个类高内聚低耦合。
+> 取舍原则：只在能真正降低耦合处引入模式，避免"为模式而模式"反增耦合。
+> 验证：每阶段均经 Debug / Release / `-DUTP_DEBUG_LOGGING=ON` 三配置零错误构建，
+> `nm` 确认 28 个公开 C 符号不变，ucat 回环 100KB + 10MB 逐字节一致。
+
+## 阶段成果
+
+| 阶段 | 内容 | 引入的抽象 |
+|------|------|-----------|
+| 1 | 删除 utp_socket.cpp 本地 ST_* 枚举改用 `utp::wire::*`；删除 wire_format.hpp 中无人使用、放错层的 `ConnState` | —（消除重复，单一来源） |
+| 2 | `MtuDiscovery`/子组件不再持有 `UtpSocket` 反向指针 | **`utp::ILogger`**（日志角色接口，`UtpSocket` 实现）；`MtuDiscovery` 现完全自包含、header-only |
+| 3 | 消除 `UtpSocket` ↔ `UtpContext` 的**双向 friend**（5 大耦合热点之首），改依赖倒置 | **`ISocketHost`**（宿主服务接口：时钟/发送/延迟ACK/统计/默认配置/注册表/回调）；`UtpContext` 实现之；`UtpSocket` 经接口访问，新增 `accept_syn/on_reset/on_icmp_*/state/...` 公开 API 取代 friend 直访 |
+| 4 | 拥塞控制策略化，算法可替换 | **`ICongestionController`**（Strategy）；`LedbatController` 为默认实现；`UtpSocket::cc_` 改为 `unique_ptr<ICongestionController>` |
+| 5 | 连接状态机改 State 模式 | **`IConnectionState`** + 8 个无数据状态单例；`close/shutdown/writev/check_timeouts` 的 switch 改为按 `state_descriptor(state)` 多态分派 |
+
+## 关键设计决策（与"低耦合"目标的取舍）
+
+- **State 模式刻意"有界"**：状态对象是无数据单例，只调用 `UtpSocket` 的一小组公开原语
+  （`mark_read_shutdown/request_close/send_fin/...`），**不 friend、不访问私有成员**，
+  因此没有重新引入 Phase 3 消除的耦合。`enum conn_.state` 仍是状态唯一真相来源
+  （线格式/日志直接用）。每包共享的窗口/ACK 流水线属于**跨状态共享算法**，不随状态
+  多态化——这是"在合适粒度用模式"，而非把单体协议逻辑硬拆进状态类（那会让状态类
+  反向依赖 socket 内部，违背低耦合）。
+- **接口允许虚函数、清晰优先**（按用户选择）：`ISocketHost`/`ICongestionController` 等
+  在热路径上有少量虚分派开销，换取可替换性与可测试性。
+- **would_log 内联**：移到 `utp_internal.h` 头内联，避免虚函数 `vlog` 在 vtable 所在 TU
+  出现跨 TU 未定义引用（Release 链接问题，已修复）。
+
+## 新增文件
+
+- `src/utp/logger.hpp` — `ILogger`
+- `src/utp/socket_host.hpp` — `ISocketHost`
+- `src/utp/congestion_control.hpp` — `ICongestionController`
+- `src/utp/connection_state.hpp` — `IConnectionState`
+
+## 后续可选项（未做，留待评估）
+
+- 回调层（`UtpCallbacks` 虚基类 + `CFunctionCallbackAdapter` 适配器）已是合理的
+  策略+适配器，本次保留未动。
+- `utp_call_*` 16 个自由转发函数可考虑收敛，但它们服务于 C 边界，价值有限。
+
+---
+
+# （历史）TASK: UtpSocket 数据分组 + 独立函数归位重构
 
 > **状态（2026-06-11 第二次更新）**：遗留工作 #1-#8 已全部修复完毕（工作区待提交）。
 > 修复过程中另发现并修复了两个清单外的问题（见文末"修复记录"）。

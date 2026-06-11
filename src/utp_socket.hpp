@@ -32,6 +32,7 @@
 #include "utp/sequence_buffer.hpp"
 #include "utp/delay_history.hpp"
 #include "utp/wire_format.hpp"
+#include "utp/connection_state.hpp"
 #include "utp_callbacks.h"
 
 using namespace utp::config;
@@ -100,7 +101,7 @@ struct ParsedPacket {
 // 连接标识 + 全局状态
 struct ConnectionId {
 	utp::Address addr;              // 对端地址
-	UtpContext* ctx = nullptr;      // 所属上下文
+	ISocketHost* host = nullptr;      // 宿主环境(依赖倒置)，由 UtpContext 实现
 	uint32 conn_seed = 0;           // 连接种子（用于生成连接ID）
 	uint32 conn_id_recv = 0;        // 接收方向连接ID
 	uint32 conn_id_send = 0;        // 发送方向连接ID
@@ -146,36 +147,36 @@ struct TimingState {
 	uint16 fast_resend_seq_nr = 1;  // 快速重传起始序列号
 };
 
-class UtpSocket {
+class UtpSocket : public utp::ILogger {
 public:
-	UtpSocket(UtpContext* _ctx);
-	~UtpSocket();
+	UtpSocket(ISocketHost* _host);
+	~UtpSocket() override;
 
 	// ── 内联工具方法 ──────────────────────────────────
 
-	void log(int level, char const *fmt, ...)
+	// ILogger 实现：按 level 过滤，加 "指针 地址 连接ID" 前缀后转发给 context。
+	// 变参版 log(level, fmt, ...) 由基类 utp::ILogger 提供，自动转调此处。
+	void vlog(int level, char const *fmt, va_list va) override
 	{
-		va_list va;
 		char buf[4096], buf2[4096];
 
-		if (!conn_.ctx->would_log(level)) {
+		if (!conn_.host->would_log(level)) {
 			return;
 		}
 
-		va_start(va, fmt);
 		vsnprintf(buf, 4096, fmt, va);
-		va_end(va);
 		buf[4095] = '\0';
 
 		snprintf(buf2, 4096, "%p %s %06u %s", static_cast<void*>(this), addrfmt(conn_.addr, addrbuf), conn_.conn_id_recv, buf);
 		buf2[4095] = '\0';
 
-		conn_.ctx->log_unchecked(this, buf2);
+		// 直接经回调把日志送出（已自行加好前缀，无需再过 log_unchecked）
+		utp_call_log(conn_.host->handle(), this, (const byte *)buf2);
 	}
 
 	size_t get_rcv_window()
 	{
-		const size_t numbuf = utp_call_get_read_buffer_size(conn_.ctx, this);
+		const size_t numbuf = utp_call_get_read_buffer_size(conn_.host->handle(), this);
 		assert((int)numbuf >= 0);
 		return recv_.opt_rcvbuf > numbuf ? recv_.opt_rcvbuf - numbuf : 0;
 	}
@@ -189,14 +190,14 @@ public:
 	{
 		socklen_t len;
 		SOCKADDR_STORAGE sa = conn_.addr.get_sockaddr_storage(&len);
-		return utp_call_get_udp_mtu(conn_.ctx, this, (const struct sockaddr *)&sa, len);
+		return utp_call_get_udp_mtu(conn_.host->handle(), this, (const struct sockaddr *)&sa, len);
 	}
 
 	size_t get_udp_overhead()
 	{
 		socklen_t len;
 		SOCKADDR_STORAGE sa = conn_.addr.get_sockaddr_storage(&len);
-		return utp_call_get_udp_overhead(conn_.ctx, this, (const struct sockaddr *)&sa, len);
+		return utp_call_get_udp_overhead(conn_.host->handle(), this, (const struct sockaddr *)&sa, len);
 	}
 
 	size_t get_overhead()
@@ -237,13 +238,67 @@ public:
 	int get_delays(uint32 *ours, uint32 *theirs, uint32 *age);
 	utp_socket_stats* get_stats();
 
-	UtpContext* context() { return conn_.ctx; }
+	utp_context* context() { return conn_.host->handle(); }
 	void* userdata() { return conn_.userdata; }
 	void set_userdata(void *userdata) { conn_.userdata = userdata; }
 
-	// ── 友元：协议逻辑跨 socket / context 边界，互为友元类即可，
-	//          C API 一律经由上面的公开成员，无需逐函数 friend ──
-	friend class UtpContext;
+	// ── 供宿主(UtpContext)调用的公开 API（取代原 friend 直接访问私有成员）──
+
+	CONN_STATE state() const { return conn_.state; }
+	uint32 conn_id_send() const { return conn_.conn_id_send; }
+	uint32 recv_conn_id() const { return conn_.conn_id_recv; }
+	const utp::Address& peer_addr() const { return conn_.addr; }
+
+	// ── 连接状态机（State 模式）：按当前状态取无数据状态单例进行行为分派 ──
+	static IConnectionState* state_descriptor(CONN_STATE s);
+	IConnectionState& fsm() const { return *state_descriptor(conn_.state); }
+
+	// 状态对象使用的公开原语（仅暴露所需操作，避免 friend 直访私有成员）
+	void mark_read_shutdown() { recv_.read_shutdown = true; }
+	void request_close()      { send_.close_requested_ = true; }
+	bool fin_sent() const     { return send_.fin_sent; }
+	bool fin_acked() const    { return send_.fin_sent_acked_; }
+	void set_conn_state(CONN_STATE s) { conn_.state = s; }
+	void send_fin();                 // 标记 fin_sent 并发出 ST_FIN（.cpp）
+	void backoff_rto_for_close();    // 关闭时对 SYN_SENT 做 RTO 退避（.cpp）
+
+	// 延迟 ACK 列表：宿主持有容器，通过这两个访问器读写 socket 自身的列表下标
+	int  ack_index() const { return ida_; }
+	void set_ack_index(int i) { ida_ = i; }
+
+	// 被动接受 SYN：记录对端序号、生成随机发送序号、进入 CS_SYN_RECV
+	void accept_syn(uint16 peer_seq) {
+		recv_.ack_nr = peer_seq;
+		send_.seq_nr = utp_call_get_random(conn_.host->handle(), NULL);
+		timing_.fast_resend_seq_nr = send_.seq_nr;
+		conn_.state = CS_SYN_RECV;
+	}
+
+	// 收到对端 RST：按是否已请求关闭决定 DESTROY/RESET，并上报开销与错误
+	void on_reset(size_t recv_len) {
+		conn_.state = send_.close_requested_ ? CS_DESTROY : CS_RESET;
+		utp_call_on_overhead_statistics(conn_.host->handle(), this, false, recv_len + get_udp_overhead(), close_overhead);
+		const int err = (conn_.state == CS_SYN_SENT) ? UTP_ECONNREFUSED : UTP_ECONNRESET;
+		utp_call_on_error(conn_.host->handle(), this, err);
+	}
+
+	// ICMP「需要分片」：调整 MTU 搜索并记录日志
+	void on_icmp_fragmentation(uint16 next_hop_mtu) {
+		if (next_hop_mtu >= 576 && next_hop_mtu < 0x2000)
+			mtu_.handle_icmp_fragmentation(next_hop_mtu, conn_.host->current_ms());
+		else
+			mtu_.handle_icmp_unknown(conn_.host->current_ms());
+		log(UTP_LOG_MTU, "MTU [ICMP] floor:%d ceiling:%d current:%d",
+			mtu_.floor(), mtu_.ceiling(), mtu_.last());
+	}
+
+	// ICMP 错误：CS_IDLE 忽略；否则按是否已关闭转 DESTROY/RESET 并上报错误
+	void on_icmp_error() {
+		if (conn_.state == CS_IDLE) return;
+		const int err = (conn_.state == CS_SYN_SENT) ? UTP_ECONNREFUSED : UTP_ECONNRESET;
+		conn_.state = send_.close_requested_ ? CS_DESTROY : CS_RESET;
+		utp_call_on_error(conn_.host->handle(), this, err);
+	}
 
 private:
 	// ── 内部实现方法（仅被自身成员函数调用）──
@@ -271,8 +326,8 @@ private:
 	byte  duplicate_ack_ = 0;       // 重复ACK计数
 
 	// 已提取的子组件
-	MtuDiscovery    mtu_;           // MTU探测对象
-	LedbatController cc_;           // LEDBAT拥塞控制对象
+	MtuDiscovery    mtu_;                            // MTU探测对象
+	std::unique_ptr<ICongestionController> cc_;      // 拥塞控制策略（默认 LEDBAT，可替换）
 
 	#ifdef _DEBUG
 	utp_socket_stats stats_;        // 统计信息（仅DEBUG模式）

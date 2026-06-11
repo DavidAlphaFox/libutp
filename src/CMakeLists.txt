@@ -18,7 +18,11 @@ set(UTP_HEADERS_INTERNAL
     utp_callbacks.h
     utp_callbacks.hpp
     utp/ledbat.hpp
+    utp/congestion_control.hpp
     utp/mtu_discovery.hpp
+    utp/logger.hpp
+    utp/socket_host.hpp
+    utp/connection_state.hpp
     utp_internal.h
     utp_socket.hpp
     utp_types.h

@@ -88,17 +88,8 @@ static_assert(sizeof(PacketFormatAckV1) == 26, "PacketFormatAckV1 must be exactl
 	#pragma pack(pop)
 #endif
 
-// 连接状态机
-enum ConnState : std::uint8_t {
-	CS_UNINITIALIZED  = 0,  // 未初始化
-	CS_IDLE,                  // 空闲：连接已关闭
-	CS_SYN_SENT,              // 已发送 SYN：等待 SYN-ACK
-	CS_SYN_RECV,              // 已收到 SYN：等待连接建立
-	CS_CONNECTED,             // 已连接：可以传输数据
-	CS_CONNECTED_FULL,        // 连接已满：接收窗口已满
-	CS_RESET,                 // 重置：连接被强制关闭
-	CS_DESTROY,               // 销毁：连接正在清理资源
-};
+// 注：连接状态机枚举 CONN_STATE 定义在 utp_socket.hpp（属于 socket 层，
+// 不是线格式的一部分），此处不再重复定义。
 
 // 数据包大小分类 (用于统计)
 enum PacketSizeBucket : std::uint32_t {

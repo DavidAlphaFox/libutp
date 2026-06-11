@@ -35,6 +35,7 @@
 #include "utp_callbacks.hpp"
 #include "utp/address.hpp"
 #include "utp/endian.hpp"
+#include "utp/socket_host.hpp"
 
 extern char addrbuf[65];
 #define addrfmt(x, s) x.fmt(s, sizeof(s))
@@ -102,14 +103,20 @@ using SocketMap = std::unordered_map<UtpSocketKey, UtpSocket*, UtpSocketKeyHash>
 // UtpContext: uTP 协议库全局上下文,所有套接字共享一个 context 实例。
 // 整个库采用单线程事件驱动模型,context 持有回调表、活跃套接字表、待发 ACK 列表、
 // 已发送 RST 缓存,以及当前时间缓存等公共状态。应用层通过 utp_create_context 间接创建。
-class UtpContext {
+class UtpContext : public ISocketHost {
 public:
 	UtpContext();
-	~UtpContext();
+	~UtpContext() override;
 
 	void log(int level, utp_socket *socket, char const *fmt, ...);
 	void log_unchecked(utp_socket *socket, char const *fmt, ...);
-	bool would_log(int level);
+	// ISocketHost：按 level 过滤日志（内联，供多 TU 调用）
+	bool would_log(int level) override {
+		if (level == UTP_LOG_NORMAL) return log_normal_;
+		if (level == UTP_LOG_MTU) return log_mtu_;
+		if (level == UTP_LOG_DEBUG) return log_debug_;
+		return true;
+	}
 
 	void register_sent_packet(size_t length);
 	void send_to_addr_impl(const byte *p, size_t len, const utp::Address &addr, int flags = 0);
@@ -126,14 +133,30 @@ public:
 	int set_option(int opt, int val);
 	int get_option(int opt);
 
-	UtpCallbacks* callbacks() { return callbacks_.get(); }
 	utp_context_stats* stats() { return &context_stats_; }
 	void* userdata() { return userdata_; }
 	void set_userdata(void *userdata) { userdata_ = userdata; }
 
-	// 协议逻辑跨 socket / context 边界，互为友元类即可，
-	// C API 一律经由公开成员，无需逐函数 friend
-	friend class UtpSocket;
+	// ── ISocketHost 实现：UtpSocket 通过此窄接口获取宿主服务，
+	//    不再 friend 访问 UtpContext 私有成员（依赖倒置）──
+	uint64 current_ms() const override { return current_ms_; }
+	uint64 refresh_clock(UtpSocket* who) override;          // .cpp（需 get_milliseconds 回调）
+	void send_to(const byte* p, size_t len, const utp::Address& addr, int flags) override {
+		send_to_addr_impl(p, len, addr, flags);
+	}
+	void schedule_ack(UtpSocket* s) override;               // .cpp（需 UtpSocket 完整类型）
+	void remove_ack(UtpSocket* s) override;                 // .cpp
+	void record_raw_recv(size_t len) override;              // .cpp（需 wire::packet_size_bucket）
+	size_t default_target_delay() const override { return target_delay_; }
+	size_t default_sndbuf() const override { return opt_sndbuf_; }
+	size_t default_rcvbuf() const override { return opt_rcvbuf_; }
+	bool has_socket(const utp::Address& addr, uint32 recv_id) const override {
+		return sockets_.count(UtpSocketKey(addr, recv_id)) != 0;
+	}
+	void register_socket(UtpSocket* s) override;            // .cpp
+	void on_socket_destroyed(UtpSocket* s) override;        // .cpp
+	UtpCallbacks* callbacks() override { return callbacks_.get(); }
+	utp_context* handle() override { return this; }
 
 private:
 	// 按连接 ID 查找 socket：先按 id 精确匹配（接收方向 ID），
