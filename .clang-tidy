@@ -1,0 +1,14 @@
+# 静态检查基线：聚焦真实缺陷类检查，规避与既有 C 边界风格冲突的规则
+Checks: >
+  bugprone-*,
+  performance-*,
+  modernize-use-nullptr,
+  modernize-use-override,
+  cppcoreguidelines-owning-memory,
+  -bugprone-easily-swappable-parameters,
+  -bugprone-narrowing-conversions,
+  -bugprone-reserved-identifier
+
+WarningsAsErrors: ''
+HeaderFilterRegex: '(src|include)/.*\.(h|hpp)$'
+FormatStyle: file

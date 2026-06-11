@@ -1,0 +1,23 @@
+# 与现有代码风格一致：Tab 缩进、附着大括号、较宽行限
+# 注意：不要对历史文件做全量重排版（diff 噪音），只用于新增/修改的代码段
+# （配合 git-clang-format 或编辑器的“仅格式化改动行”）
+BasedOnStyle: LLVM
+Language: Cpp
+Standard: c++20
+
+UseTab: ForIndentation
+IndentWidth: 4
+TabWidth: 4
+ColumnLimit: 100
+
+BreakBeforeBraces: Attach
+AllowShortFunctionsOnASingleLine: Inline
+AllowShortIfStatementsOnASingleLine: Never
+AlwaysBreakTemplateDeclarations: Yes
+
+PointerAlignment: Right
+SpaceAfterTemplateKeyword: true
+AccessModifierOffset: -4
+
+SortIncludes: false        # 包含顺序有平台语义（如 utp_types.h 的 WIN32 分支），不自动排序
+ReflowComments: false      # 保留手写中文注释排版

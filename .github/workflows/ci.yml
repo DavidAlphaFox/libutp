@@ -1,0 +1,54 @@
+name: CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+
+jobs:
+  build-and-test:
+    name: ${{ matrix.name }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Debug
+            cmake_args: -DCMAKE_BUILD_TYPE=Debug
+          - name: Release
+            cmake_args: -DCMAKE_BUILD_TYPE=Release
+          - name: Debug+Logging
+            cmake_args: -DCMAKE_BUILD_TYPE=Debug -DUTP_DEBUG_LOGGING=ON
+          - name: ASan+UBSan
+            cmake_args: -DCMAKE_BUILD_TYPE=Debug -DUTP_SANITIZE=ON
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure
+        run: cmake -S . -B build ${{ matrix.cmake_args }}
+
+      - name: Build
+        run: cmake --build build -j$(nproc)
+
+      - name: Run tests
+        run: ctest --test-dir build --output-on-failure
+
+      - name: Verify exported C symbols (Release only)
+        if: matrix.name == 'Release'
+        run: |
+          count=$(nm -g --defined-only build/src/libutp.a | grep -c " T utp_")
+          echo "exported utp_* symbols: $count"
+          test "$count" -eq 28
+
+      - name: ucat loopback transfer (10MB)
+        if: matrix.name != 'ASan+UBSan'
+        run: |
+          head -c 10485760 /dev/urandom > in.bin
+          ./build/examples/ucat -l -p 34567 > out.bin 2>/dev/null &
+          SRV=$!
+          sleep 0.5
+          timeout 120 ./build/examples/ucat 127.0.0.1 34567 < in.bin 2>/dev/null
+          sleep 1
+          kill $SRV 2>/dev/null || true
+          cmp in.bin out.bin
