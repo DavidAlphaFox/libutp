@@ -147,14 +147,14 @@ public:
 		return (msec - last_rwin_decay_) >= MAX_WINDOW_DECAY;
 	}
 
-	// 初始化 delay history (在 utp_initialize_socket 中调用)
+	// 初始化 delay history (在 UtpSocket::initialize 中调用)
 	void init_delay_histories(uint64 current_ms) {
 		our_hist_.clear(current_ms);
 		their_hist_.clear(current_ms);
 		rtt_hist_.clear(current_ms);
 	}
 
-	// 初始化时间相关字段 (在 utp_initialize_socket 中调用)
+	// 初始化时间相关字段 (在 UtpSocket::initialize 中调用)
 	void init_timing(uint64 current_ms) {
 		average_sample_time_ = current_ms + 5000;
 		last_rwin_decay_ = (int64)current_ms - MAX_WINDOW_DECAY;

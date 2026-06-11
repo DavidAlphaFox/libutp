@@ -57,9 +57,11 @@ extern "C" {
 #include "utp_types.h"
 
 // uTP Socket 句柄（不透明指针，具体定义位于库内部）
-typedef void								utp_socket;
+// 使用前置声明的 struct typedef：对外保持不透明，同时保留编译期类型检查，
+// 防止 socket / context 句柄互相误传。
+typedef struct UtpSocket					utp_socket;
 // uTP Context 句柄（不透明指针，保存一组 Socket 的全局状态）
-typedef void								utp_context;
+typedef struct UtpContext					utp_context;
 
 /*
  * 通用枚举常量

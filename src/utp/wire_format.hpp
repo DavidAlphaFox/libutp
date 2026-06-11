@@ -25,6 +25,7 @@
 // uTP 网络协议线格式定义
 // 定义网络传输的数据包结构，字节布局必须与原始 PacketFormatV1 匹配以保持协议兼容性
 
+#include <cstddef>
 #include <cstdint>
 #include "endian.hpp"
 
@@ -117,6 +118,16 @@ inline constexpr std::uint32_t packet_size_from_bucket(PacketSizeBucket b) {
 		case PACKET_SIZE_BIG_BUCKET:   return 1400;
 		default: return 0;
 	}
+}
+
+// 根据数据包大小获取分类（packet_size_from_bucket 的正向映射，
+// 边界取自同一处，收发统计共用，避免两份阶梯漂移）
+inline constexpr PacketSizeBucket packet_size_bucket(std::size_t len) {
+	if (len <= packet_size_from_bucket(PACKET_SIZE_EMPTY_BUCKET)) return PACKET_SIZE_EMPTY_BUCKET;
+	if (len <= packet_size_from_bucket(PACKET_SIZE_SMALL_BUCKET)) return PACKET_SIZE_SMALL_BUCKET;
+	if (len <= packet_size_from_bucket(PACKET_SIZE_MID_BUCKET))   return PACKET_SIZE_MID_BUCKET;
+	if (len <= packet_size_from_bucket(PACKET_SIZE_BIG_BUCKET))   return PACKET_SIZE_BIG_BUCKET;
+	return PACKET_SIZE_HUGE_BUCKET;
 }
 
 }  // namespace utp::wire

@@ -80,14 +80,6 @@ enum {
 	ST_NUM_STATES,
 };
 
-static const cstr flagnames[] = {
-	"ST_DATA","ST_FIN","ST_STATE","ST_RESET","ST_SYN"
-};
-
-static const cstr statenames[] = {
-	"UNINITIALIZED", "IDLE","SYN_SENT", "SYN_RECV", "CONNECTED","CONNECTED_FULL","DESTROY_DELAY","RESET","DESTROY"
-};
-
 // -----------------------------------------------------------------------------
 // 函数：remove_socket_from_ack_list
 // 功能：将指定 socket 从全局延迟 ACK 列表（ctx->ack_sockets_）中移除。
@@ -160,21 +152,7 @@ void UtpSocket::remove_from_ack_list()
 // -----------------------------------------------------------------------------
 void UtpContext::register_sent_packet(size_t length)
 {
-	// 尺寸 < MID 区间：进一步细分为 EMPTY / SMALL / MID 三个桶
-	if (length <= PACKET_SIZE_MID) {
-		if (length <= PACKET_SIZE_EMPTY) {
-			context_stats_._nraw_send[PACKET_SIZE_EMPTY_BUCKET]++;
-		} else if (length <= PACKET_SIZE_SMALL) {
-			context_stats_._nraw_send[PACKET_SIZE_SMALL_BUCKET]++;
-		} else
-			context_stats_._nraw_send[PACKET_SIZE_MID_BUCKET]++;
-	} else {
-		// 尺寸 ≥ MID 区间：细分为 BIG / HUGE 两个桶
-		if (length <= PACKET_SIZE_BIG) {
-			context_stats_._nraw_send[PACKET_SIZE_BIG_BUCKET]++;
-		} else
-			context_stats_._nraw_send[PACKET_SIZE_HUGE_BUCKET]++;
-	}
+	context_stats_._nraw_send[utp::wire::packet_size_bucket(length)]++;
 }
 
 // -----------------------------------------------------------------------------
@@ -234,7 +212,7 @@ void UtpSocket::schedule_ack()
 		log(UTP_LOG_DEBUG, "schedule_ack");
 		#endif
 		// 当前未在列表中：加入列表尾部，并记录其下标到 ida
-		ctx->ack_sockets_.push_back(this); ida_ = ctx->ack_sockets_.size() - 1;
+		conn_.ctx->ack_sockets_.push_back(this); ida_ = conn_.ctx->ack_sockets_.size() - 1;
 	} else {
 		#if UTP_DEBUG_LOGGING
 		log(UTP_LOG_DEBUG, "schedule_ack: already in list");
@@ -273,15 +251,15 @@ void UtpSocket::schedule_ack()
 void UtpSocket::send_data(byte* b, size_t length, BandwidthType type, uint32 flags)
 {
 	// 取当前微秒时间戳，填入包头（对端用于 RTT 测量）
-	uint64 time = utp_call_get_microseconds(ctx, this);
+	uint64 time = utp_call_get_microseconds(conn_.ctx, this);
 
 	PacketFormatV1* b1 = (PacketFormatV1*)b;
 	b1->tv_usec = (uint32)time;
 	// reply_micro：发送方测得的延迟反馈，对端 LEDBAT 控制器将以此为目标延迟基线
-	b1->reply_micro = reply_micro_;
+	b1->reply_micro = timing_.reply_micro;
 
 	// 记录最近一次发送时间，用于 KEEPALIVE_INTERVAL 触发保活
-	last_sent_packet_ = ctx->current_ms_;
+	timing_.last_sent_packet = conn_.ctx->current_ms_;
 
 	#ifdef _DEBUG
 	// 调试模式下累计发送字节与包数
@@ -299,19 +277,19 @@ void UtpSocket::send_data(byte* b, size_t length, BandwidthType type, uint32 fla
 			n = length + get_udp_overhead();
 		}
 		// 上报带宽统计：true 表示发送方向
-		utp_call_on_overhead_statistics(ctx, this, true, n, type);
+		utp_call_on_overhead_statistics(conn_.ctx, this, true, n, type);
 	}
 #if UTP_DEBUG_LOGGING
 	// 调试日志：解码包头字段输出
 	int flags2 = b1->type();
-	uint16 seq_nr_ = b1->seq_nr;
-	uint16 ack_nr_ = b1->ack_nr;
-	log(UTP_LOG_DEBUG, "send %s len:%u id:%u timestamp:" I64u " reply_micro_:%u flags:%s seq_nr_:%u ack_nr_:%u",
-		addrfmt(addr, addrbuf), (uint)length, conn_id_send_, time, reply_micro_, flagnames[flags2],
-		seq_nr_, ack_nr_);
+	uint16 pkt_seq_nr = b1->seq_nr;
+	uint16 pkt_ack_nr = b1->ack_nr;
+	log(UTP_LOG_DEBUG, "send %s len:%u id:%u timestamp:" I64u " reply_micro_:%u flags:%s pkt_seq_nr:%u pkt_ack_nr:%u",
+		addrfmt(conn_.addr, addrbuf), (uint)length, conn_.conn_id_send, time, timing_.reply_micro, flagnames[flags2],
+		pkt_seq_nr, pkt_ack_nr);
 #endif
 	// 通过回调真正发送 UDP 报文
-	ctx->send_to_addr_impl(b, length, addr, flags);
+	conn_.ctx->send_to_addr_impl(b, length, conn_.addr, flags);
 	// 数据包已发出，移除自己可能存在的延迟 ACK 调度
 	remove_from_ack_list();
 }
@@ -351,18 +329,18 @@ void UtpSocket::send_ack(bool synack)
 
 	size_t len;
 	// 取当前接收窗口大小并记录到 last_rcv_win_
-	last_rcv_win_ = get_rcv_window();
+	recv_.last_rcv_win = get_rcv_window();
 	pfa.pf.set_version(1);
 	pfa.pf.set_type(ST_STATE);
 	pfa.pf.ext = 0;
-	pfa.pf.connid = conn_id_send_;
-	pfa.pf.ack_nr = ack_nr_;
-	pfa.pf.seq_nr = seq_nr_;
-	pfa.pf.windowsize = (uint32)last_rcv_win_;
+	pfa.pf.connid = conn_.conn_id_send;
+	pfa.pf.ack_nr = recv_.ack_nr;
+	pfa.pf.seq_nr = send_.seq_nr;
+	pfa.pf.windowsize = (uint32)recv_.last_rcv_win;
 	len = sizeof(PacketFormatV1);
 
 	// 存在乱序包且未完成 FIN：构造选择性 ACK（EACK）扩展
-	if (reorder_count_ != 0 && !recv_.got_fin_reached_) {
+	if (recv_.reorder_count != 0 && !recv_.got_fin_reached_) {
 		// SYN-ACK 不应携带 EACK
 		assert(!synack);
 		pfa.pf.ext = 1;          // 启用扩展
@@ -371,16 +349,16 @@ void UtpSocket::send_ack(bool synack)
 		uint m = 0;               // EACK 位图（共 32 位）
 
 		// ack_nr_+1 应为空（保证 ACK 累积语义）
-		assert(inbuf_.get(ack_nr_ + 1) == NULL);
+		assert(recv_.inbuf.get(recv_.ack_nr + 1) == NULL);
 		// 限制窗口扫描最大为 14+16 = 30 位
-		size_t window = min<size_t>(14+16, inbuf_.size());
+		size_t window = min<size_t>(14+16, recv_.inbuf.size());
 		for (size_t i = 0; i < window; i++) {
 			// ack_nr_+i+2 处是否有包：bit i 表示 ack_nr_+i+2
-			if (inbuf_.get(ack_nr_ + i + 2) != NULL) {
+			if (recv_.inbuf.get(recv_.ack_nr + i + 2) != NULL) {
 				m |= 1 << i;
 
 				#if UTP_DEBUG_LOGGING
-				log(UTP_LOG_DEBUG, "EACK packet [%u]", ack_nr_ + i + 2);
+				log(UTP_LOG_DEBUG, "EACK packet [%u]", recv_.ack_nr + i + 2);
 				#endif
 			}
 		}
@@ -393,11 +371,11 @@ void UtpSocket::send_ack(bool synack)
 		len += 4 + 2;
 
 		#if UTP_DEBUG_LOGGING
-		log(UTP_LOG_DEBUG, "Sending EACK %u [%u] bits:[%032b]", ack_nr_, conn_id_send_, m);
+		log(UTP_LOG_DEBUG, "Sending EACK %u [%u] bits:[%032b]", recv_.ack_nr, conn_.conn_id_send, m);
 		#endif
 	} else {
 		#if UTP_DEBUG_LOGGING
-		log(UTP_LOG_DEBUG, "Sending ACK %u [%u]", ack_nr_, conn_id_send_);
+		log(UTP_LOG_DEBUG, "Sending ACK %u [%u]", recv_.ack_nr, conn_.conn_id_send);
 		#endif
 	}
 
@@ -425,15 +403,15 @@ void UtpSocket::send_ack(bool synack)
 void UtpSocket::send_keep_alive()
 {
 	// 临时将 ack_nr_ 减 1，让 send_ack 发出"过期一个序号"的 ACK（保活语义）
-	ack_nr_--;
+	recv_.ack_nr--;
 
 	#if UTP_DEBUG_LOGGING
-	log(UTP_LOG_DEBUG, "Sending KeepAlive ACK %u [%u]", ack_nr_, conn_id_send_);
+	log(UTP_LOG_DEBUG, "Sending KeepAlive ACK %u [%u]", recv_.ack_nr, conn_.conn_id_send);
 	#endif
 	// 复用 send_ack 发送 STATE 类型保活 ACK
 	send_ack();
 	// 恢复 ack_nr_ 到真实值
-	ack_nr_++;
+	recv_.ack_nr++;
 }
 
 // -----------------------------------------------------------------------------
@@ -448,12 +426,12 @@ void UtpSocket::send_keep_alive()
 // 参数：
 //   ctx            - utp 上下文，用于回调与统计。
 //   addr           - 目标对端地址。
-//   conn_id_send_  - 发送方向的连接 ID（对端用于识别）。
-//   ack_nr_        - 当前确认序号（通常为收到的对端 seq）。
-//   seq_nr_        - 当前发送序号。
+//   conn_id_send  - 发送方向的连接 ID（对端用于识别）。
+//   ack_nr        - 当前确认序号（通常为收到的对端 seq）。
+//   seq_nr        - 当前发送序号。
 // -----------------------------------------------------------------------------
 void UtpSocket::send_rst(UtpContext *ctx,
-	const utp::Address &addr, uint32 conn_id_send_, uint16 ack_nr_, uint16 seq_nr_)
+	const utp::Address &addr, uint32 conn_id_send, uint16 ack_nr, uint16 seq_nr)
 {
 	PacketFormatV1 pf1;
 	zeromem(&pf1);
@@ -462,9 +440,9 @@ void UtpSocket::send_rst(UtpContext *ctx,
 	pf1.set_version(1);
 	pf1.set_type(ST_RESET);    // 标记为 RESET 类型
 	pf1.ext = 0;
-	pf1.connid = conn_id_send_;
-	pf1.ack_nr = ack_nr_;
-	pf1.seq_nr = seq_nr_;
+	pf1.connid = conn_id_send;
+	pf1.ack_nr = ack_nr;
+	pf1.seq_nr = seq_nr;
 	pf1.windowsize = 0;        // 复位包窗口大小无意义
 	len = sizeof(PacketFormatV1);
 
@@ -487,7 +465,7 @@ void UtpSocket::send_rst(UtpContext *ctx,
 // -----------------------------------------------------------------------------
 void UtpSocket::send_packet(OutgoingPacket *pkt)
 {
-	time_t cur_time = utp_call_get_milliseconds(this->ctx, this);
+	time_t cur_time = utp_call_get_milliseconds(this->conn_.ctx, this);
 
 	if (pkt->transmissions == 0 || pkt->need_resend) {
 		cc_.add_in_flight(pkt->payload);
@@ -496,8 +474,8 @@ void UtpSocket::send_packet(OutgoingPacket *pkt)
 	pkt->need_resend = false;
 
 	PacketFormatV1* p1 = (PacketFormatV1*)pkt->data.data();
-	p1->ack_nr = ack_nr_;
-	pkt->time_sent = utp_call_get_microseconds(this->ctx, this);
+	p1->ack_nr = recv_.ack_nr;
+	pkt->time_sent = utp_call_get_microseconds(this->conn_.ctx, this);
 
 	bool use_as_mtu_probe = false;
 
@@ -509,10 +487,10 @@ void UtpSocket::send_packet(OutgoingPacket *pkt)
 		&& pkt->length > mtu_.floor()
 		&& pkt->length <= mtu_.ceiling()
 		&& !mtu_.probe_seq()
-		&& seq_nr_ != 1
+		&& send_.seq_nr != 1
 		&& pkt->transmissions == 0) {
 
- 		mtu_.set_probe((seq_nr_ - 1) & ACK_NR_MASK, (uint32)pkt->length);
+ 		mtu_.set_probe((send_.seq_nr - 1) & ACK_NR_MASK, (uint32)pkt->length);
 		assert(pkt->length >= mtu_.floor());
 		assert(pkt->length <= mtu_.ceiling());
  		use_as_mtu_probe = true;
@@ -522,7 +500,7 @@ void UtpSocket::send_packet(OutgoingPacket *pkt)
 
 	pkt->transmissions++;
 	send_data((byte*)pkt->data.data(), pkt->length,
-		(state_ == CS_SYN_SENT) ? connect_overhead
+		(conn_.state == CS_SYN_SENT) ? connect_overhead
 		: (pkt->transmissions == 1) ? payload_bandwidth
 		: retransmit_overhead, use_as_mtu_probe ? UTP_UDP_DONTFRAG : 0);
 }
@@ -549,27 +527,27 @@ bool UtpSocket::is_full(int bytes)
 	size_t packet_size = get_packet_size();
 	if (bytes < 0) bytes = packet_size;
 	else if (bytes > (int)packet_size) bytes = (int)packet_size;
-	size_t max_send = min(min(cc_.max_window(), opt_sndbuf_), max_window_user_);
+	size_t max_send = min(min(cc_.max_window(), send_.opt_sndbuf), send_.max_window_user);
 
-	if (cur_window_packets_ >= OUTGOING_BUFFER_MAX_SIZE - 1) {
+	if (send_.cur_window_packets >= OUTGOING_BUFFER_MAX_SIZE - 1) {
 
 		#if UTP_DEBUG_LOGGING
-		log(UTP_LOG_DEBUG, "is_full:false cur_window_packets_:%d MAX:%d", cur_window_packets_, OUTGOING_BUFFER_MAX_SIZE - 1);
+		log(UTP_LOG_DEBUG, "is_full:false cur_window_packets_:%d MAX:%d", send_.cur_window_packets, OUTGOING_BUFFER_MAX_SIZE - 1);
 		#endif
 
-		cc_.mark_window_full(ctx->current_ms_);
+		cc_.mark_window_full(conn_.ctx->current_ms_);
 		return true;
 	}
 
 	#if UTP_DEBUG_LOGGING
 	log(UTP_LOG_DEBUG, "is_full:%s. cur_window_:%u pkt:%u max:%u cur_window_packets_:%u max_window_:%u"
 		, (cc_.cur_window() + bytes > max_send) ? "true" : "false"
-		, (uint)cc_.cur_window(), bytes, max_send, cur_window_packets_
+		, (uint)cc_.cur_window(), bytes, max_send, send_.cur_window_packets
 		, (uint)cc_.max_window());
 	#endif
 
 	if (cc_.cur_window() + bytes > max_send) {
-		cc_.mark_window_full(ctx->current_ms_);
+		cc_.mark_window_full(conn_.ctx->current_ms_);
 		return true;
 	}
 	return false;
@@ -593,13 +571,13 @@ bool UtpSocket::is_full(int bytes)
 bool UtpSocket::flush_packets()
 {
 	size_t packet_size = get_packet_size();
-	for (uint16 i = seq_nr_ - cur_window_packets_; i != seq_nr_; ++i) {
-		OutgoingPacket *pkt = (OutgoingPacket*)outbuf_.get(i);
+	for (uint16 i = send_.seq_nr - send_.cur_window_packets; i != send_.seq_nr; ++i) {
+		OutgoingPacket *pkt = (OutgoingPacket*)send_.outbuf.get(i);
 		if (pkt == 0 || (pkt->transmissions > 0 && pkt->need_resend == false)) continue;
 		if (is_full()) return true;
 
-		if (i != ((seq_nr_ - 1) & ACK_NR_MASK) ||
-			cur_window_packets_ == 1 ||
+		if (i != ((send_.seq_nr - 1) & ACK_NR_MASK) ||
+			send_.cur_window_packets == 1 ||
 			pkt->payload >= packet_size) {
 			send_packet(pkt);
 		}
@@ -628,22 +606,22 @@ bool UtpSocket::flush_packets()
 // -----------------------------------------------------------------------------
 void UtpSocket::write_outgoing_packet(size_t payload, uint flags, struct utp_iovec *iovec, size_t num_iovecs)
 {
-	if (cur_window_packets_ == 0) {
-		cc_.set_initial_rto(ctx->current_ms_);
+	if (send_.cur_window_packets == 0) {
+		cc_.set_initial_rto(conn_.ctx->current_ms_);
 		assert(cc_.cur_window() == 0);
 	}
 
 	size_t packet_size = get_packet_size();
 	do {
-		assert(cur_window_packets_ < OUTGOING_BUFFER_MAX_SIZE);
+		assert(send_.cur_window_packets < OUTGOING_BUFFER_MAX_SIZE);
 		assert(flags == ST_DATA || flags == ST_FIN);
 
 		size_t added = 0;
 
 		OutgoingPacket *pkt = NULL;
 
-		if (cur_window_packets_ > 0) {
-			pkt = (OutgoingPacket*)outbuf_.get(seq_nr_ - 1);
+		if (send_.cur_window_packets > 0) {
+			pkt = (OutgoingPacket*)send_.outbuf.get(send_.seq_nr - 1);
 		}
 
 		const size_t header_size = get_header_size();
@@ -652,7 +630,7 @@ void UtpSocket::write_outgoing_packet(size_t payload, uint flags, struct utp_iov
 		if (payload && pkt && !pkt->transmissions && pkt->payload < packet_size) {
 			added = min(payload + pkt->payload, max<size_t>(packet_size, pkt->payload)) - pkt->payload;
 			pkt->data.resize(header_size + pkt->payload + added);
-			outbuf_.put(seq_nr_ - 1, pkt);
+			send_.outbuf.put(send_.seq_nr - 1, pkt);
 			append = false;
 			assert(!pkt->need_resend);
 		} else {
@@ -698,22 +676,22 @@ void UtpSocket::write_outgoing_packet(size_t payload, uint flags, struct utp_iov
 		pkt->payload += added;
 		pkt->length = header_size + pkt->payload;
 
-		last_rcv_win_ = get_rcv_window();
+		recv_.last_rcv_win = get_rcv_window();
 
 	PacketFormatV1* p1 = (PacketFormatV1*)pkt->data.data();
 		p1->set_version(1);
 		p1->set_type(flags);
 		p1->ext = 0;
-		p1->connid = conn_id_send_;
-		p1->windowsize = (uint32)last_rcv_win_;
-		p1->ack_nr = ack_nr_;
+		p1->connid = conn_.conn_id_send;
+		p1->windowsize = (uint32)recv_.last_rcv_win;
+		p1->ack_nr = recv_.ack_nr;
 
 		if (append) {
-			outbuf_.ensure_size(seq_nr_, cur_window_packets_);
-			outbuf_.put(seq_nr_, pkt);
-			p1->seq_nr = seq_nr_;
-			seq_nr_++;
-			cur_window_packets_++;
+			send_.outbuf.ensure_size(send_.seq_nr, send_.cur_window_packets);
+			send_.outbuf.put(send_.seq_nr, pkt);
+			p1->seq_nr = send_.seq_nr;
+			send_.seq_nr++;
+			send_.cur_window_packets++;
 		}
 
 		payload -= added;
@@ -735,13 +713,13 @@ void UtpSocket::write_outgoing_packet(size_t payload, uint flags, struct utp_iov
 #ifdef _DEBUG
 void UtpSocket::check_invariant()
 {
-	if (reorder_count_ > 0) {
-		assert(inbuf_.get(ack_nr_ + 1) == NULL);
+	if (recv_.reorder_count > 0) {
+		assert(recv_.inbuf.get(recv_.ack_nr + 1) == NULL);
 	}
 
 	size_t outstanding_bytes = 0;
-	for (int i = 0; i < cur_window_packets_; ++i) {
-		OutgoingPacket *pkt = (OutgoingPacket*)outbuf_.get(seq_nr_ - i - 1);
+	for (int i = 0; i < send_.cur_window_packets; ++i) {
+		OutgoingPacket *pkt = (OutgoingPacket*)send_.outbuf.get(send_.seq_nr - i - 1);
 		if (pkt == 0 || pkt->transmissions == 0 || pkt->need_resend) continue;
 		outstanding_bytes += pkt->payload;
 	}
@@ -770,30 +748,30 @@ void UtpSocket::check_timeouts()
 	check_invariant();
 	#endif
 
-	assert(cur_window_packets_ == 0 || outbuf_.get(seq_nr_ - cur_window_packets_));
+	assert(send_.cur_window_packets == 0 || send_.outbuf.get(send_.seq_nr - send_.cur_window_packets));
 
 	#if UTP_DEBUG_LOGGING
 	log(UTP_LOG_DEBUG, "CheckTimeouts timeout:%d max_window_:%u cur_window_:%u "
 			 "state:%s cur_window_packets_:%u",
-			 (int)(cc_.rto_timeout() - ctx->current_ms_), (uint)cc_.max_window(), (uint)cc_.cur_window(),
-			 statenames[state_], cur_window_packets_);
+			 (int)(cc_.rto_timeout() - conn_.ctx->current_ms_), (uint)cc_.max_window(), (uint)cc_.cur_window(),
+			 statenames[conn_.state], send_.cur_window_packets);
 	#endif
-	if (state_ != CS_DESTROY) flush_packets();
+	if (conn_.state != CS_DESTROY) flush_packets();
 
-	switch (state_) {
+	switch (conn_.state) {
 	case CS_SYN_SENT:
 	case CS_SYN_RECV:
 	case CS_CONNECTED_FULL:
 	case CS_CONNECTED: {
 
-		if ((int)(ctx->current_ms_ - cc_.zerowindow_time()) >= 0 && max_window_user_ == 0) {
-			max_window_user_ = PACKET_SIZE;
+		if ((int)(conn_.ctx->current_ms_ - cc_.zerowindow_time()) >= 0 && send_.max_window_user == 0) {
+			send_.max_window_user = PACKET_SIZE;
 		}
 
-		if (cc_.is_rto_expired(ctx->current_ms_)) {
+		if (cc_.is_rto_expired(conn_.ctx->current_ms_)) {
 
 			bool ignore_loss = mtu_.handle_probe_timeout(
-				(seq_nr_ - 1) & ACK_NR_MASK, cur_window_packets_, ctx->current_ms_);
+				(send_.seq_nr - 1) & ACK_NR_MASK, send_.cur_window_packets, conn_.ctx->current_ms_);
 			if (ignore_loss) {
 				log(UTP_LOG_MTU, "MTU [PROBE-TIMEOUT] floor:%d ceiling:%d current:%d"
 					, mtu_.floor(), mtu_.ceiling(), mtu_.last());
@@ -809,60 +787,60 @@ void UtpSocket::check_timeouts()
 			*/
 			const uint new_timeout = ignore_loss ? cc_.retransmit_timeout() : cc_.retransmit_timeout() * 2;
 
-			if (state_ == CS_SYN_RECV) {
-				state_ = CS_DESTROY;
-				utp_call_on_error(ctx, this, UTP_ETIMEDOUT);
+			if (conn_.state == CS_SYN_RECV) {
+				conn_.state = CS_DESTROY;
+				utp_call_on_error(conn_.ctx, this, UTP_ETIMEDOUT);
 				return;
 			}
-			if (cc_.retransmit_count() >= 4 || (state_ == CS_SYN_SENT && cc_.retransmit_count() >= 2)) {
+			if (cc_.retransmit_count() >= 4 || (conn_.state == CS_SYN_SENT && cc_.retransmit_count() >= 2)) {
 				if (send_.close_requested_)
-					state_ = CS_DESTROY;
+					conn_.state = CS_DESTROY;
 				else
-					state_ = CS_RESET;
-				utp_call_on_error(ctx, this, UTP_ETIMEDOUT);
+					conn_.state = CS_RESET;
+				utp_call_on_error(conn_.ctx, this, UTP_ETIMEDOUT);
 				return;
 			}
 			cc_.set_retransmit_timeout(new_timeout);
-			cc_.set_rto_timeout(ctx->current_ms_ + new_timeout);
+			cc_.set_rto_timeout(conn_.ctx->current_ms_ + new_timeout);
 
 			if (!ignore_loss) {
 				duplicate_ack_ = 0;
 
 				int packet_size = get_packet_size();
-				cc_.on_rto_timeout(ctx->current_ms_, (size_t)packet_size, cur_window_packets_);
+				cc_.on_rto_timeout(conn_.ctx->current_ms_, (size_t)packet_size, send_.cur_window_packets);
 			}
-			for (int i = 0; i < cur_window_packets_; ++i) {
-				OutgoingPacket *pkt = (OutgoingPacket*)outbuf_.get(seq_nr_ - i - 1);
+			for (int i = 0; i < send_.cur_window_packets; ++i) {
+				OutgoingPacket *pkt = (OutgoingPacket*)send_.outbuf.get(send_.seq_nr - i - 1);
 				if (pkt == 0 || pkt->transmissions == 0 || pkt->need_resend) continue;
 				pkt->need_resend = true;
 				cc_.remove_in_flight(pkt->payload);
 			}
-			if (cur_window_packets_ > 0) {
+			if (send_.cur_window_packets > 0) {
 				cc_.increment_retransmit_count();
 				log(UTP_LOG_NORMAL, "Packet timeout. Resend. seq_nr_:%u. timeout:%u "
 					"max_window_:%u cur_window_packets_:%d"
-					, seq_nr_ - cur_window_packets_, cc_.retransmit_timeout()
-					, (uint)cc_.max_window(), int(cur_window_packets_));
+					, send_.seq_nr - send_.cur_window_packets, cc_.retransmit_timeout()
+					, (uint)cc_.max_window(), int(send_.cur_window_packets));
 
 				timing_.fast_timeout_ = true;
-				timeout_seq_nr_ = seq_nr_;
+				timing_.timeout_seq_nr = send_.seq_nr;
 
-				OutgoingPacket *pkt = (OutgoingPacket*)outbuf_.get(seq_nr_ - cur_window_packets_);
+				OutgoingPacket *pkt = (OutgoingPacket*)send_.outbuf.get(send_.seq_nr - send_.cur_window_packets);
 				assert(pkt);
 				send_packet(pkt);
 			}
 		}
 
-		if (state_ == CS_CONNECTED_FULL && !is_full()) {
-			state_ = CS_CONNECTED;
+		if (conn_.state == CS_CONNECTED_FULL && !is_full()) {
+			conn_.state = CS_CONNECTED;
 			#if UTP_DEBUG_LOGGING
 			log(UTP_LOG_DEBUG, "Socket writable. max_window_:%u cur_window_:%u packet_size:%u",
 				(uint)cc_.max_window(), (uint)cc_.cur_window(), (uint)get_packet_size());
 			#endif
-			utp_call_on_state_change(this->ctx, this, UTP_STATE_WRITABLE);
+			utp_call_on_state_change(this->conn_.ctx, this, UTP_STATE_WRITABLE);
 		}
-		if (state_ >= CS_CONNECTED && !send_.fin_sent) {
-			if ((int)(ctx->current_ms_ - last_sent_packet_) >= KEEPALIVE_INTERVAL) {
+		if (conn_.state >= CS_CONNECTED && !send_.fin_sent) {
+			if ((int)(conn_.ctx->current_ms_ - timing_.last_sent_packet) >= KEEPALIVE_INTERVAL) {
 				send_keep_alive();
 			}
 		}
@@ -900,7 +878,7 @@ void UtpSocket::check_timeouts()
 // -----------------------------------------------------------------------------
 int UtpSocket::ack_packet(uint16 seq)
 {
-	OutgoingPacket *pkt = (OutgoingPacket*)outbuf_.get(seq);
+	OutgoingPacket *pkt = (OutgoingPacket*)send_.outbuf.get(seq);
 
 	if (pkt == NULL) {
 
@@ -926,11 +904,11 @@ int UtpSocket::ack_packet(uint16 seq)
 		seq, (uint)pkt->payload, pkt->need_resend);
 	#endif
 
-	outbuf_.put(seq, nullptr);
+	send_.outbuf.put(seq, nullptr);
 
 	if (pkt->transmissions == 1) {
-		const uint32 ertt = (uint32)((utp_call_get_microseconds(this->ctx, this) - pkt->time_sent) / 1000);
-		cc_.update_rtt(ertt, ctx->current_ms_);
+		const uint32 ertt = (uint32)((utp_call_get_microseconds(this->conn_.ctx, this) - pkt->time_sent) / 1000);
+		cc_.update_rtt(ertt, conn_.ctx->current_ms_);
 
 		#if UTP_DEBUG_LOGGING
 		log(UTP_LOG_DEBUG, "rtt:%u avg:%u var:%u rto:%u",
@@ -939,7 +917,7 @@ int UtpSocket::ack_packet(uint16 seq)
 
 	} else {
 		cc_.set_retransmit_timeout(cc_.rto_ms());
-		cc_.set_rto_timeout(ctx->current_ms_ + cc_.rto_ms());
+		cc_.set_rto_timeout(conn_.ctx->current_ms_ + cc_.rto_ms());
 	}
 	if (!pkt->need_resend) {
 		cc_.remove_in_flight(pkt->payload);
@@ -970,19 +948,19 @@ int UtpSocket::ack_packet(uint16 seq)
 // -----------------------------------------------------------------------------
 size_t UtpSocket::selective_ack_bytes(uint base, const byte* mask, byte len, int64& min_rtt)
 {
-	if (cur_window_packets_ == 0) return 0;
+	if (send_.cur_window_packets == 0) return 0;
 
 	size_t acked_bytes = 0;
 	int bits = len * 8;
-	uint64 now = utp_call_get_microseconds(this->ctx, this);
+	uint64 now = utp_call_get_microseconds(this->conn_.ctx, this);
 
 	do {
 		uint v = base + bits;
 
-		if (((seq_nr_ - v - 1) & ACK_NR_MASK) >= (uint16)(cur_window_packets_ - 1))
+		if (((send_.seq_nr - v - 1) & ACK_NR_MASK) >= (uint16)(send_.cur_window_packets - 1))
 			continue;
 
-		OutgoingPacket *pkt = (OutgoingPacket*)outbuf_.get(v);
+		OutgoingPacket *pkt = (OutgoingPacket*)send_.outbuf.get(v);
 		if (!pkt || pkt->transmissions == 0)
 			continue;
 
@@ -1020,7 +998,7 @@ enum { MAX_EACK = 128 };
 // -----------------------------------------------------------------------------
 void UtpSocket::selective_ack(uint base, const byte *mask, byte len)
 {
-	if (cur_window_packets_ == 0) return;
+	if (send_.cur_window_packets == 0) return;
 
 	int bits = len * 8 - 1;
 
@@ -1044,14 +1022,14 @@ void UtpSocket::selective_ack(uint base, const byte *mask, byte len)
 	do {
 		uint v = base + bits;
 
-		if (((seq_nr_ - v - 1) & ACK_NR_MASK) >= (uint16)(cur_window_packets_ - 1))
+		if (((send_.seq_nr - v - 1) & ACK_NR_MASK) >= (uint16)(send_.cur_window_packets - 1))
 			continue;
 
 		bool bit_set = bits >= 0 && mask[bits>>3] & (1 << (bits & 7));
 
 		if (bit_set) count++;
 
-		OutgoingPacket *pkt = (OutgoingPacket*)outbuf_.get(v);
+		OutgoingPacket *pkt = (OutgoingPacket*)send_.outbuf.get(v);
 		if (!pkt || pkt->transmissions == 0) {
 
 			#if UTP_DEBUG_LOGGING
@@ -1062,12 +1040,12 @@ void UtpSocket::selective_ack(uint base, const byte *mask, byte len)
 		}
 
 		if (bit_set) {
-			assert((v & outbuf_.mask()) != ((seq_nr_ - cur_window_packets_) & outbuf_.mask()));
+			assert((v & send_.outbuf.mask()) != ((send_.seq_nr - send_.cur_window_packets) & send_.outbuf.mask()));
 			ack_packet(v);
 			continue;
 		}
 
-		if (((v - fast_resend_seq_nr_) & ACK_NR_MASK) <= OUTGOING_BUFFER_MAX_SIZE &&
+		if (((v - timing_.fast_resend_seq_nr) & ACK_NR_MASK) <= OUTGOING_BUFFER_MAX_SIZE &&
 			count >= DUPLICATE_ACKS_BEFORE_RESEND) {
 			if (nr >= MAX_EACK - 2) {
 				memmove(resends, &resends[MAX_EACK/2], MAX_EACK/2 * sizeof(resends[0]));
@@ -1083,12 +1061,12 @@ void UtpSocket::selective_ack(uint base, const byte *mask, byte len)
 
 			#if UTP_DEBUG_LOGGING
 			log(UTP_LOG_DEBUG, "not resending %u count:%d dup_ack:%u fast_resend_seq_nr_:%u",
-				v, count, duplicate_ack_, fast_resend_seq_nr_);
+				v, count, duplicate_ack_, timing_.fast_resend_seq_nr);
 			#endif
 		}
 	} while (--bits >= -1);
 
-	if (((base - 1 - fast_resend_seq_nr_) & ACK_NR_MASK) <= OUTGOING_BUFFER_MAX_SIZE &&
+	if (((base - 1 - timing_.fast_resend_seq_nr) & ACK_NR_MASK) <= OUTGOING_BUFFER_MAX_SIZE &&
 		count >= DUPLICATE_ACKS_BEFORE_RESEND) {
 		resends[nr++] = (base - 1) & ACK_NR_MASK;
 
@@ -1099,7 +1077,7 @@ void UtpSocket::selective_ack(uint base, const byte *mask, byte len)
 	} else {
 		#if UTP_DEBUG_LOGGING
 		log(UTP_LOG_DEBUG, "not resending %u count:%d dup_ack:%u fast_resend_seq_nr_:%u",
-			base - 1, count, duplicate_ack_, fast_resend_seq_nr_);
+			base - 1, count, duplicate_ack_, timing_.fast_resend_seq_nr);
 		#endif
 	}
 
@@ -1107,7 +1085,7 @@ void UtpSocket::selective_ack(uint base, const byte *mask, byte len)
 	int i = 0;
 	while (nr > 0) {
 		uint v = resends[--nr];
-		OutgoingPacket *pkt = (OutgoingPacket*)outbuf_.get(v);
+		OutgoingPacket *pkt = (OutgoingPacket*)send_.outbuf.get(v);
 
 		if (!pkt) continue;
 
@@ -1120,13 +1098,13 @@ void UtpSocket::selective_ack(uint base, const byte *mask, byte len)
 		#endif
 
 		send_packet(pkt);
-		fast_resend_seq_nr_ = (v + 1) & ACK_NR_MASK;
+		timing_.fast_resend_seq_nr = (v + 1) & ACK_NR_MASK;
 
 		if (++i >= 4) break;
 	}
 
 	if (back_off)
-		cc_.maybe_decay_win(ctx->current_ms_);
+		cc_.maybe_decay_win(conn_.ctx->current_ms_);
 
 	duplicate_ack_ = count;
 }
@@ -1159,10 +1137,10 @@ UtpSocket::UtpSocket(UtpContext* _ctx)
 	, mtu_(this)
 	, cc_()
 {
-	inbuf_.initialize(16);
-	outbuf_.initialize(16);
+	recv_.inbuf.initialize(16);
+	send_.outbuf.initialize(16);
 	cc_.set_ssthresh(_ctx->opt_sndbuf_);
-	memset(extensions_, 0, sizeof(extensions_));
+	memset(conn_.extensions, 0, sizeof(conn_.extensions));
 	#ifdef _DEBUG
 	memset(&stats_, 0, sizeof(utp_socket_stats));
 	#endif
@@ -1185,22 +1163,22 @@ UtpSocket::~UtpSocket()
 	log(UTP_LOG_DEBUG, "Killing socket");
 	#endif
 
-	utp_call_on_state_change(ctx, this, UTP_STATE_DESTROYING);
+	utp_call_on_state_change(conn_.ctx, this, UTP_STATE_DESTROYING);
 
-	if (ctx->last_utp_socket_ == this) {
-		ctx->last_utp_socket_ = NULL;
+	if (conn_.ctx->last_utp_socket_ == this) {
+		conn_.ctx->last_utp_socket_ = NULL;
 	}
 
-	auto erased = ctx->sockets_.erase(UtpSocketKey(addr, conn_id_recv_));
+	auto erased = conn_.ctx->sockets_.erase(UtpSocketKey(conn_.addr, conn_.conn_id_recv));
 	assert(erased == 1);
 
 	remove_from_ack_list();
 
-	for (size_t i = 0; i < inbuf_.buf_size(); i++) {
-		delete (InboundPacket*)inbuf_.element(i);
+	for (size_t i = 0; i < recv_.inbuf.buf_size(); i++) {
+		delete (InboundPacket*)recv_.inbuf.element(i);
 	}
- 	for (size_t i = 0; i < outbuf_.buf_size(); i++) {
-		delete (OutgoingPacket*)outbuf_.element(i);
+ 	for (size_t i = 0; i < send_.outbuf.buf_size(); i++) {
+		delete (OutgoingPacket*)send_.outbuf.element(i);
 	}
 }
 

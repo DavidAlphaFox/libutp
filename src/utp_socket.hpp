@@ -56,6 +56,15 @@ enum CONN_STATE {
 	CS_DESTROY             // 待销毁
 };
 
+// 调试日志用的名称表（与 utp::wire::PacketType / CONN_STATE 一一对应）
+inline constexpr const char* flagnames[] = {
+	"ST_DATA","ST_FIN","ST_STATE","ST_RESET","ST_SYN"
+};
+
+inline constexpr const char* statenames[] = {
+	"UNINITIALIZED","IDLE","SYN_SENT","SYN_RECV","CONNECTED","CONNECTED_FULL","RESET","DESTROY"
+};
+
 struct OutgoingPacket {
 	size_t length = 0;             // 数据包总长度（含包头）
 	size_t payload = 0;            // 有效载荷长度（用户数据）
@@ -79,7 +88,7 @@ struct ParsedPacket {
 	uint8  type = 0;                // packet type (ST_DATA, ST_STATE, etc.)
 	uint32 timestamp = 0;           // sender timestamp (tv_usec)
 	uint32 reply_micro = 0;         // our delay as measured by remote
-	uint16 windowsize = 0;          // advertised window
+	uint32 windowsize = 0;          // advertised window（线上字段为 32 位，勿用 uint16 截断）
 };
 
 // =============================================================================
@@ -158,7 +167,7 @@ public:
 		va_end(va);
 		buf[4095] = '\0';
 
-		snprintf(buf2, 4096, "%p %s %06u %s", this, addrfmt(conn_.addr, addrbuf), conn_.conn_id_recv, buf);
+		snprintf(buf2, 4096, "%p %s %06u %s", static_cast<void*>(this), addrfmt(conn_.addr, addrbuf), conn_.conn_id_recv, buf);
 		buf2[4095] = '\0';
 
 		conn_.ctx->log_unchecked(this, buf2);
@@ -202,8 +211,8 @@ public:
 	void send_ack(bool synack = false);
 	void send_keep_alive();
 	static void send_rst(UtpContext *ctx,
-						 const utp::Address &addr, uint32 conn_id_send_,
-						 uint16 ack_nr_, uint16 seq_nr_);
+						 const utp::Address &addr, uint32 conn_id_send,
+						 uint16 ack_nr, uint16 seq_nr);
 
 	size_t get_packet_size() const;
 
@@ -215,24 +224,26 @@ public:
 	void remove_from_ack_list();
 	void register_recv_packet(size_t len);
 	size_t process_incoming(const byte *packet, size_t len, bool syn = false);
+	void initialize(const struct sockaddr *addr, socklen_t addrlen,
+					bool need_seed_gen, uint32 seed, uint32 id_recv, uint32 id_send);
 	int connect(const struct sockaddr *to, socklen_t tolen);
+	ssize_t writev(struct utp_iovec *iovec_input, size_t num_iovecs);
 	void close();
 	void shutdown(int how);
 	void read_drained();
+	int get_peername(struct sockaddr *addr_out, socklen_t *addrlen);
+	int set_option(int opt, int val);
+	int get_option(int opt);
+	int get_delays(uint32 *ours, uint32 *theirs, uint32 *age);
+	utp_socket_stats* get_stats();
 
-	// ── 友元：允许 UtpContext 和 C API 包装函数访问私有成员 ──
+	UtpContext* context() { return conn_.ctx; }
+	void* userdata() { return conn_.userdata; }
+	void set_userdata(void *userdata) { conn_.userdata = userdata; }
+
+	// ── 友元：协议逻辑跨 socket / context 边界，互为友元类即可，
+	//          C API 一律经由上面的公开成员，无需逐函数 friend ──
 	friend class UtpContext;
-	friend void utp_initialize_socket(utp_socket*, const struct sockaddr*, socklen_t, bool, uint32, uint32, uint32);
-	friend ssize_t utp_writev(utp_socket*, struct utp_iovec*, size_t);
-	friend utp_socket* utp_create_socket(utp_context*);
-	friend int utp_getpeername(utp_socket*, struct sockaddr*, socklen_t*);
-	friend utp_context* utp_get_context(utp_socket*);
-	friend void* utp_set_userdata(utp_socket*, void*);
-	friend void* utp_get_userdata(utp_socket*);
-	friend utp_socket_stats* utp_get_stats(utp_socket*);
-	friend int utp_setsockopt(UtpSocket*, int, int);
-	friend int utp_getsockopt(UtpSocket*, int);
-	friend int utp_get_delays(UtpSocket*, uint32*, uint32*, uint32*);
 
 private:
 	// ── 内部实现方法（仅被自身成员函数调用）──
@@ -267,37 +278,4 @@ private:
 	utp_socket_stats stats_;        // 统计信息（仅DEBUG模式）
 	#endif
 
-	// ── 兼容性别名（过渡期使用，最终删除）──────────────────
-	utp::Address& addr = conn_.addr;
-	UtpContext*& ctx = conn_.ctx;
-	void*& userdata_ = conn_.userdata;
-	uint32& conn_seed_ = conn_.conn_seed;
-	uint32& conn_id_recv_ = conn_.conn_id_recv;
-	uint32& conn_id_send_ = conn_.conn_id_send;
-	CONN_STATE& state_ = conn_.state;
-	size_t& target_delay_ = conn_.target_delay;
-	byte (&extensions_)[8] = conn_.extensions;
-
-	uint16& ack_nr_ = recv_.ack_nr;
-	uint16& reorder_count_ = recv_.reorder_count;
-	uint16& eof_pkt_ = recv_.eof_pkt;
-	size_t& opt_rcvbuf_ = recv_.opt_rcvbuf;
-	size_t& last_rcv_win_ = recv_.last_rcv_win;
-	utp::RawSequenceBuffer& inbuf_ = recv_.inbuf;
-	// got_fin / got_fin_reached_ / read_shutdown 是位域，直接使用 recv_.xxx
-
-	uint16& seq_nr_ = send_.seq_nr;
-	uint16& cur_window_packets_ = send_.cur_window_packets;
-	size_t& opt_sndbuf_ = send_.opt_sndbuf;
-	size_t& max_window_user_ = send_.max_window_user;
-	utp::RawSequenceBuffer& outbuf_ = send_.outbuf;
-	// 注意：fin_sent / fin_sent_acked_ / close_requested_ 是位域，使用 send_.xxx
-
-	uint32& reply_micro_ = timing_.reply_micro;
-	uint64& last_measured_delay_ = timing_.last_measured_delay;
-	uint64& last_got_packet_ = timing_.last_got_packet;
-	uint64& last_sent_packet_ = timing_.last_sent_packet;
-	uint16& timeout_seq_nr_ = timing_.timeout_seq_nr;
-	uint16& fast_resend_seq_nr_ = timing_.fast_resend_seq_nr;
-	// 注意：fast_timeout_ 是位域，使用 timing_.fast_timeout
 };

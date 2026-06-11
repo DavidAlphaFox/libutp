@@ -121,21 +121,26 @@ public:
 
 	UtpSocket* parse_icmp_payload(const byte *buffer, size_t len, const struct sockaddr *to, socklen_t tolen);
 
-	UtpCallbacks* callbacks() { return callbacks_.get(); }
+	UtpSocket* create_socket();
+	void set_callback(int callback_name, utp_callback_t *proc);
+	int set_option(int opt, int val);
+	int get_option(int opt);
 
+	UtpCallbacks* callbacks() { return callbacks_.get(); }
+	utp_context_stats* stats() { return &context_stats_; }
+	void* userdata() { return userdata_; }
+	void set_userdata(void *userdata) { userdata_ = userdata; }
+
+	// 协议逻辑跨 socket / context 边界，互为友元类即可，
+	// C API 一律经由公开成员，无需逐函数 friend
 	friend class UtpSocket;
-	friend void utp_set_callback(utp_context*, int, utp_callback_t*);
-	friend void* utp_context_set_userdata(utp_context*, void*);
-	friend void* utp_context_get_userdata(utp_context*);
-	friend utp_context_stats* utp_get_context_stats(utp_context*);
-	friend int utp_context_set_option(utp_context*, int, int);
-	friend int utp_context_get_option(utp_context*, int);
-	friend utp_socket* utp_create_socket(utp_context*);
-	friend void utp_initialize_socket(utp_socket*, const struct sockaddr*, socklen_t, bool, uint32, uint32, uint32);
-	friend ssize_t utp_writev(utp_socket*, struct utp_iovec*, size_t);
-	friend int utp_get_delays(UtpSocket*, uint32*, uint32*, uint32*);
 
 private:
+	// 按连接 ID 查找 socket：先按 id 精确匹配（接收方向 ID），
+	// 再尝试 id±1 且发送方向 ID 等于 id 的连接（对端视角的 ID 偏移）。
+	// RST 处理与 ICMP 错误归属共用此规则。
+	UtpSocket* find_socket_for_id(const utp::Address &addr, uint32 id);
+
 	void *userdata_;
 	std::unique_ptr<UtpCallbacks> callbacks_;
 
