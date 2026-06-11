@@ -38,7 +38,7 @@
 // 注意：每包共享的窗口/ACK 处理流水线不随状态切换而多态化（那部分是跨状态共享的
 // 算法，不属于"每状态各异"的行为），仍留在 UtpSocket，符合"在合适粒度上用模式"。
 
-class UtpSocket;
+struct UtpSocket;
 
 struct IConnectionState {
 	virtual ~IConnectionState() = default;

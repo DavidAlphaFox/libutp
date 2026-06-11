@@ -28,7 +28,7 @@
 #include "utp_types.h"
 
 // UtpSocket 前向声明（完整定义在 utp_internal.cpp）
-class UtpSocket;
+struct UtpSocket;
 
 // UtpCallbacks: uTP 协议回调虚基类。
 // 用户继承此类，重写所需方法。仅 sendto() 为纯虚函数（必须实现），

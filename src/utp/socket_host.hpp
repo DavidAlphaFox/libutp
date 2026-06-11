@@ -40,7 +40,7 @@
 #include "utp_types.h"
 #include "utp/address.hpp"
 
-class UtpSocket;
+struct UtpSocket;
 class UtpCallbacks;
 
 struct ISocketHost {

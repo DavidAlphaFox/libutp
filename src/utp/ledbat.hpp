@@ -67,27 +67,27 @@ public:
 	//   packet_size    单包有效载荷大小
 	int32 apply_ccontrol(size_t bytes_acked, uint32 actual_delay, int64 min_rtt,
 	                     uint64 current_ms, size_t opt_sndbuf, size_t target_delay,
-	                     size_t packet_size);
+	                     size_t packet_size) override;
 
 	// -- RTT 估算 --
 	// 在 ack_packet 中调用: 更新 rtt_/rtt_var_ (RFC 6298 EWMA),
 	// 同步 rto_/retransmit_timeout_/rto_timeout_。
 	// ertt 为本次 ACK 测得的 RTT (毫秒)。
-	void update_rtt(uint32 ertt, uint64 current_ms);
+	void update_rtt(uint32 ertt, uint64 current_ms) override;
 
 	// -- 延迟采样 --
 	// 处理收到的 actual_delay 样本: 更新长时窗平均延迟 (5s 粒度)
 	// 和时钟漂移估计。仅在 actual_delay != 0 时调用。
-	void update_delay_average(uint32 actual_delay, uint64 current_ms);
+	void update_delay_average(uint32 actual_delay, uint64 current_ms) override;
 
 	// -- 窗口衰减 --
 	// 每隔 MAX_WINDOW_DECAY 将窗口减半, 同时退出慢启动并更新 ssthresh_。
-	void maybe_decay_win(uint64 current_ms);
+	void maybe_decay_win(uint64 current_ms) override;
 
 	// -- 窗口配额管理 --
-	void add_in_flight(size_t bytes) { cur_window_ += bytes; }
-	void remove_in_flight(size_t bytes) { assert(cur_window_ >= bytes); cur_window_ -= bytes; }
-	void mark_window_full(uint64 current_ms) { last_maxed_out_window_ = current_ms; }
+	void add_in_flight(size_t bytes) override { cur_window_ += bytes; }
+	void remove_in_flight(size_t bytes) override { assert(cur_window_ >= bytes); cur_window_ -= bytes; }
+	void mark_window_full(uint64 current_ms) override { last_maxed_out_window_ = current_ms; }
 
 	// -- 窗口检查 --
 	// 判定是否还能再发 bytes 字节, 限幅 = min(max_window_, opt_sndbuf, max_window_user)。
@@ -96,51 +96,51 @@ public:
 	// -- RTO 超时处理 --
 	// RTO 触发: 减小拥塞窗口 (空闲时 2/3 衰减; 否则重置为 packet_size 并进入慢启动)。
 	// cur_window_packets 是 UtpSocket 的状态 (在飞包数), 由调用方传入。
-	void on_rto_timeout(uint64 current_ms, size_t packet_size, uint16 cur_window_packets);
+	void on_rto_timeout(uint64 current_ms, size_t packet_size, uint16 cur_window_packets) override;
 
 	// -- 拥塞窗口访问器 --
-	size_t max_window() const { return max_window_; }
-	size_t cur_window() const { return cur_window_; }
+	size_t max_window() const override { return max_window_; }
+	size_t cur_window() const override { return cur_window_; }
 	size_t ssthresh() const  { return ssthresh_; }
 	bool slow_start() const  { return slow_start_; }
 
 	// -- RTT 估算访问器 --
-	uint rtt_ms() const              { return rtt_; }
-	uint rtt_var() const             { return rtt_var_; }
-	uint rto_ms() const              { return rto_; }
-	uint retransmit_timeout() const  { return retransmit_timeout_; }
-	uint16 retransmit_count() const  { return retransmit_count_; }
-	uint64 rto_timeout() const       { return rto_timeout_; }
-	uint64 zerowindow_time() const   { return zerowindow_time_; }
+	uint rtt_ms() const override              { return rtt_; }
+	uint rtt_var() const override             { return rtt_var_; }
+	uint rto_ms() const override              { return rto_; }
+	uint retransmit_timeout() const override  { return retransmit_timeout_; }
+	uint16 retransmit_count() const override  { return retransmit_count_; }
+	uint64 rto_timeout() const override       { return rto_timeout_; }
+	uint64 zerowindow_time() const override   { return zerowindow_time_; }
 
 	// -- 延迟统计访问器 --
-	int32 clock_drift() const            { return clock_drift_; }
-	int32 clock_drift_raw() const        { return clock_drift_raw_; }
-	int32 average_delay() const          { return average_delay_; }
-	int64 current_delay_sum() const     { return current_delay_sum_; }
-	int current_delay_samples() const   { return current_delay_samples_; }
-	uint32 average_delay_base() const   { return average_delay_base_; }
-	uint64 last_maxed_out_window() const { return last_maxed_out_window_; }
+	int32 clock_drift() const override            { return clock_drift_; }
+	int32 clock_drift_raw() const override        { return clock_drift_raw_; }
+	int32 average_delay() const override          { return average_delay_; }
+	int64 current_delay_sum() const override     { return current_delay_sum_; }
+	int current_delay_samples() const override   { return current_delay_samples_; }
+	uint32 average_delay_base() const override   { return average_delay_base_; }
+	uint64 last_maxed_out_window() const override { return last_maxed_out_window_; }
 	int64 last_rwin_decay() const       { return last_rwin_decay_; }
 
 	// -- 设置器 --
-	void set_max_window(size_t w)            { max_window_ = w; }
-	void set_ssthresh(size_t s)              { ssthresh_ = s; }
-	void set_zerowindow_time(uint64 t)       { zerowindow_time_ = t; }
-	void set_retransmit_count(uint16 count)  { retransmit_count_ = count; }
-	void increment_retransmit_count()        { ++retransmit_count_; }
-	void set_retransmit_timeout(uint t)      { retransmit_timeout_ = t; }
-	void set_rto_timeout(uint64 t)           { rto_timeout_ = t; }
+	void set_max_window(size_t w) override            { max_window_ = w; }
+	void set_ssthresh(size_t s) override              { ssthresh_ = s; }
+	void set_zerowindow_time(uint64 t) override       { zerowindow_time_ = t; }
+	void set_retransmit_count(uint16 count) override  { retransmit_count_ = count; }
+	void increment_retransmit_count() override        { ++retransmit_count_; }
+	void set_retransmit_timeout(uint t) override      { retransmit_timeout_ = t; }
+	void set_rto_timeout(uint64 t) override           { rto_timeout_ = t; }
 
 	// 初始化 RTO 计时器: retransmit_timeout_ = rto_, rto_timeout_ = current_ms + rto_
 	// 在 write_outgoing_packet 中首次发送数据包时调用。
-	void set_initial_rto(uint64 current_ms) {
+	void set_initial_rto(uint64 current_ms) override {
 		retransmit_timeout_ = rto_;
 		rto_timeout_ = current_ms + rto_;
 	}
 
 	// 检查 RTO 是否到期
-	bool is_rto_expired(uint64 current_ms) const {
+	bool is_rto_expired(uint64 current_ms) const override {
 		return rto_timeout_ > 0 && (int64)(current_ms - rto_timeout_) >= 0;
 	}
 
@@ -150,22 +150,22 @@ public:
 	}
 
 	// 初始化 delay history (在 UtpSocket::initialize 中调用)
-	void init_delay_histories(uint64 current_ms) {
+	void init_delay_histories(uint64 current_ms) override {
 		our_hist_.clear(current_ms);
 		their_hist_.clear(current_ms);
 		rtt_hist_.clear(current_ms);
 	}
 
 	// 初始化时间相关字段 (在 UtpSocket::initialize 中调用)
-	void init_timing(uint64 current_ms) {
+	void init_timing(uint64 current_ms) override {
 		average_sample_time_ = current_ms + 5000;
 		last_rwin_decay_ = (int64)current_ms - MAX_WINDOW_DECAY;
 	}
 
 	// -- Delay history 访问 (供 utp_process_incoming 直接操作) --
-	utp::DelayHistory& our_hist()                 { return our_hist_; }
-	utp::DelayHistory& their_hist()               { return their_hist_; }
-	utp::DelayHistory& rtt_hist()                 { return rtt_hist_; }
+	utp::DelayHistory& our_hist() override                 { return our_hist_; }
+	utp::DelayHistory& their_hist() override               { return their_hist_; }
+	utp::DelayHistory& rtt_hist() override                 { return rtt_hist_; }
 	const utp::DelayHistory& our_hist() const     { return our_hist_; }
 	const utp::DelayHistory& their_hist() const   { return their_hist_; }
 	const utp::DelayHistory& rtt_hist() const     { return rtt_hist_; }

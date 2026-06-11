@@ -45,7 +45,7 @@ inline const char* addrfmt(const utp::Address& addr, AddrFmtBuf&& buf = {}) {
 	return addr.fmt(buf.s, sizeof(buf.s));
 }
 
-class UtpSocket;
+struct UtpSocket;  // 与 utp.h 的 typedef struct 声明保持一致（MSVC ABI 关注 tag 一致性）
 
 #ifdef WIN32
 	#ifdef _MSC_VER
@@ -106,7 +106,7 @@ using SocketMap = std::unordered_map<UtpSocketKey, std::unique_ptr<UtpSocket>, U
 // UtpContext: uTP 协议库全局上下文,所有套接字共享一个 context 实例。
 // 整个库采用单线程事件驱动模型,context 持有回调表、活跃套接字表、待发 ACK 列表、
 // 已发送 RST 缓存,以及当前时间缓存等公共状态。应用层通过 utp_create_context 间接创建。
-class UtpContext : public ISocketHost {
+struct UtpContext : public ISocketHost {
 public:
 	UtpContext();
 	~UtpContext() override;
