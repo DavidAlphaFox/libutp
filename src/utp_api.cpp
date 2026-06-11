@@ -22,48 +22,47 @@
  * THE SOFTWARE.
  */
 
-// libutp 公共 C API 实现
-// 提供外部 C 语言接口，包括上下文初始化、销毁、回调设置和统计数据获取等功能
+// libutp 公共 C API —— 纯薄委托层
+// 每个 utp_* 函数只做空指针检查后 1-3 行委托给 UtpContext / UtpSocket 成员方法。
+// 协议实现见 utp_socket.cpp / utp_process.cpp / utp_context.cpp。
+// 本文件还包含 CFunctionCallbackAdapter：把 C 函数指针回调适配到
+// UtpCallbacks 虚接口（C 边界专属，故与 C API 同文件）。
 
-#include <stdio.h>
-#include <stdarg.h>
 #include <string.h>
-#include <algorithm>
 #include <cassert>
+#include <memory>
 
 #include "utp_internal.h"
-#include "utp/config.hpp"
 #include "utp_socket.hpp"
 #include "utp_callbacks.h"
-
-using namespace utp::config;
-using utp::wire::PacketFormatV1;
-using utp::wire::ST_DATA;
-using utp::wire::ST_FIN;
-using utp::wire::ST_STATE;
-using utp::wire::ST_SYN;
-using std::min;
 
 // CFunctionCallbackAdapter: 将旧的 C 函数指针回调适配到 UtpCallbacks 虚接口。
 // 由 utp_set_callback() 内部使用，无需用户直接操作。
 class CFunctionCallbackAdapter : public UtpCallbacks {
+	// 所属 context（非拥有）：C API 约定每个回调的 args->context 必须有效，
+	// 而 UtpCallbacks 虚接口签名不携带 context，故由适配器回填。
+	utp_context* ctx_;
+
 	// 函数指针数组，按 UTP_* 回调 ID 索引。
 	// 值为 nullptr 表示该回调未通过 utp_set_callback() 注册，应回退到 UtpCallbacks 虚基类默认实现。
 	utp_callback_t* handlers_[UTP_ARRAY_SIZE] = {};
 
-	// 构造一个 utp_callback_arguments 结构体并预填 callback_type 和 socket 字段。
+	// 构造一个 utp_callback_arguments 结构体并预填 context、callback_type 和 socket 字段。
 	// 各 override 方法再按需填入其余的 args 字段。
 	// 参数 type - 回调类型，对应 UTP_ON_FIREWALL/UTP_GET_MILLISECONDS 等枚举值
 	// 参数 sock - 关联的 utp_socket 指针，若回调不涉及具体 socket 可传 nullptr
-	// 返回: 已填充 callback_type 和 socket 的参数结构体
-	static utp_callback_arguments make_args(int type, utp_socket* sock) {
+	// 返回: 已填充 context、callback_type 和 socket 的参数结构体
+	utp_callback_arguments make_args(int type, utp_socket* sock) const {
 		utp_callback_arguments args{};
+		args.context = ctx_;
 		args.callback_type = type;
 		args.socket = sock;
 		return args;
 	}
 
 public:
+	explicit CFunctionCallbackAdapter(utp_context* ctx) : ctx_(ctx) {}
+
 	// 注册（或覆盖）指定 ID 的 C 风格回调函数。
 	// 由 utp_set_callback() 内部调用，外部用户通常无需直接调用。
 	// 参数 id - 回调 ID（UTP_SENDTO、UTP_GET_MILLISECONDS 等）
@@ -224,6 +223,24 @@ public:
 	}
 };
 
+// 设置（或覆盖）单个 C 风格回调。
+// 首次调用时，将默认 UtpCallbacks 替换为 C 函数指针适配器。
+// （定义于此而非 utp_context.cpp：CFunctionCallbackAdapter 是 C 边界专属适配层。）
+void UtpContext::set_callback(int callback_name, utp_callback_t *proc)
+{
+	auto* adapter = dynamic_cast<CFunctionCallbackAdapter*>(callbacks_.get());
+	if (!adapter) {
+		auto new_adapter = std::make_unique<CFunctionCallbackAdapter>(this);
+		adapter = new_adapter.get();
+		callbacks_ = std::move(new_adapter);
+	}
+	adapter->set_handler(callback_name, proc);
+}
+
+// =============================================================================
+// C API：以下全部为薄包装（空指针检查 + 1 行委托）
+// =============================================================================
+
 extern "C" {
 
 // 回调类型名称字符串数组，用于调试和日志输出
@@ -262,62 +279,20 @@ const char *utp_state_names[] = {
 	"UTP_STATE_DESTROYING",
 };
 
-// -----------------------------------------------------------------------------
-// 函数：UtpContext::UtpContext
-// 功能：构造函数，初始化 uTP 上下文。
-//
-// 参数：无
-//
-// 返回值：无
-// -----------------------------------------------------------------------------
-UtpContext::UtpContext()
-	: userdata_(NULL)
-	, callbacks_(std::make_unique<UtpCallbacks>())
-	, current_ms_(0)
-	, last_utp_socket_(NULL)
-	, log_normal_(false)
-	, log_mtu_(false)
-	, log_debug_(false)
-{
-	memset(&context_stats_, 0, sizeof(context_stats_));
-	target_delay_ = utp::config::CCONTROL_TARGET;
-	opt_rcvbuf_ = opt_sndbuf_ = 1024 * 1024;
-	last_check_ = 0;
-}
-
-// -----------------------------------------------------------------------------
-// 函数：UtpContext::~UtpContext
-// 功能：析构函数，清理上下文及其管理的所有 socket 资源。
-//
-// 参数：无
-//
-// 返回值：无
-// -----------------------------------------------------------------------------
-UtpContext::~UtpContext() {
-	std::vector<UtpSocket*> socks;
-	socks.reserve(sockets_.size());
-	for (auto& [key, socket] : sockets_) {
-		socks.push_back(socket);
-	}
-	for (auto* s : socks) {
-		delete s;
-	}
-}
+// ── 上下文生命周期 ───────────────────────────────────────────
 
 // 初始化 uTP 上下文
 // 参数: version - 版本号，必须是 2
 // 返回: 新创建的上下文指针，版本不匹配时返回 NULL
-utp_context* utp_init (int version)
+utp_context* utp_init(int version)
 {
 	assert(version == 2);
 	if (version != 2)
 		return NULL;
-	utp_context *ctx = new UtpContext;
-	return ctx;
+	return new UtpContext;
 }
 
 // 销毁 uTP 上下文及其所有资源
-// 参数: ctx - 上下文指针
 void utp_destroy(utp_context *ctx) {
 	assert(ctx);
 	if (ctx) delete ctx;
@@ -330,10 +305,9 @@ void utp_set_callback(utp_context *ctx, int callback_name, utp_callback_t *proc)
 	ctx->set_callback(callback_name, proc);
 }
 
-// 设置用户自定义数据
-// 参数: ctx - 上下文指针
-//       userdata - 用户数据指针
-// 返回: 之前的用户数据指针
+// ── 上下文属性 ──────────────────────────────────────────────
+
+// 设置用户自定义数据，返回之前的用户数据指针
 void* utp_context_set_userdata(utp_context *ctx, void *userdata) {
 	assert(ctx);
 	if (!ctx) return NULL;
@@ -342,8 +316,6 @@ void* utp_context_set_userdata(utp_context *ctx, void *userdata) {
 }
 
 // 获取用户自定义数据
-// 参数: ctx - 上下文指针
-// 返回: 用户数据指针
 void* utp_context_get_userdata(utp_context *ctx) {
 	assert(ctx);
 	if (!ctx) return NULL;
@@ -351,117 +323,13 @@ void* utp_context_get_userdata(utp_context *ctx) {
 }
 
 // 获取上下文统计信息
-// 参数: ctx - 上下文指针
-// 返回: 统计信息结构体指针
 utp_context_stats* utp_get_context_stats(utp_context *ctx) {
 	assert(ctx);
 	if (!ctx) return NULL;
 	return ctx->stats();
 }
 
-// 写入数据到 uTP socket
-// 参数: socket - socket 指针
-//       buf - 数据缓冲区
-//       len - 数据长度
-// 返回: 实际写入的字节数
-ssize_t utp_write(utp_socket *socket, void *buf, size_t len) {
-	struct utp_iovec iovec = { buf, len };
-	return utp_writev(socket, &iovec, 1);
-}
-
-}
-
-// =============================================================================
-
-// 设置（或覆盖）单个 C 风格回调。
-// 首次调用时，将默认 UtpCallbacks 替换为 C 函数指针适配器。
-void UtpContext::set_callback(int callback_name, utp_callback_t *proc)
-{
-	auto* adapter = dynamic_cast<CFunctionCallbackAdapter*>(callbacks_.get());
-	if (!adapter) {
-		auto new_adapter = std::make_unique<CFunctionCallbackAdapter>();
-		adapter = new_adapter.get();
-		callbacks_ = std::move(new_adapter);
-	}
-	adapter->set_handler(callback_name, proc);
-}
-
-// 初始化 uTP socket 的内部状态（状态机、连接 ID、计时器、拥塞控制、MTU 等）。
-// 这是所有 uTP socket 公共入口（utp_connect、utp_accept、utp_create_socket）的共同底层。
-// 参数 addr - 对端地址
-// 参数 addrlen - 对端地址长度
-// 参数 need_seed_gen - 是否需要重新生成连接种子和连接 ID
-//                     （主动 connect 时为 true，服务端接受时为 false）
-// 参数 seed - 连接种子；need_seed_gen 为 true 时被本函数覆写
-// 参数 id_recv - 接收方向连接 ID；need_seed_gen 为 true 时被本函数覆写
-// 参数 id_send - 发送方向连接 ID；need_seed_gen 为 true 时被本函数覆写
-void UtpSocket::initialize(	const struct sockaddr *addr,
-							socklen_t addrlen,
-							bool need_seed_gen,
-							uint32 seed,
-							uint32 id_recv,
-							uint32 id_send)
-{
-	utp::Address psaddr = utp::Address((const SOCKADDR_STORAGE*)addr, addrlen);
-
-	if (need_seed_gen) {
-		do {
-			seed = utp_call_get_random(conn_.host->handle(), this);
-			seed &= 0xffff;
-		} while (conn_.host->has_socket(psaddr, seed));
-
-		id_recv += seed;
-		id_send += seed;
-	}
-
-	conn_.state						= CS_IDLE;
-	conn_.conn_seed					= seed;
-	conn_.conn_id_recv				= id_recv;
-	conn_.conn_id_send				= id_send;
-	conn_.addr					= psaddr;
-	conn_.host->refresh_clock(nullptr);
-	timing_.last_got_packet			= conn_.host->current_ms();
-	timing_.last_sent_packet			= conn_.host->current_ms();
-	timing_.last_measured_delay		= conn_.host->current_ms() + 0x70000000;
-	cc_->init_timing(conn_.host->current_ms());
-	cc_->init_delay_histories(conn_.host->current_ms());
-
-	mtu_.reset((uint32)get_udp_mtu(), conn_.host->current_ms());
-	mtu_.set_last_to_ceiling();
-
-	conn_.host->register_socket(this);
-
-	cc_->set_max_window(get_packet_size());
-
-	#if UTP_DEBUG_LOGGING
-	log(UTP_LOG_DEBUG, "UTP socket initialized");
-	#endif
-}
-
-// 创建一个未初始化的 uTP socket。
-// 创建后 socket 处于 CS_UNINITIALIZED 状态，必须通过 utp_connect 发起主动连接，
-// 或由协议栈在接收到 SYN 时内部调用 UtpSocket::initialize 转为 CS_SYN_RECV。
-// 返回: 新创建的 socket 指针
-UtpSocket* UtpContext::create_socket()
-{
-	// 构造后 send_.seq_nr 与 timing_.fast_resend_seq_nr 均为默认值 1（NSDMI 已同步）；
-	// connect()/accept_syn() 会在随机化 seq_nr 时重新对齐二者。
-	UtpSocket *conn = new UtpSocket(this);
-	return conn;
-}
-
-utp_socket*	utp_create_socket(utp_context *ctx)
-{
-	assert(ctx);
-	if (!ctx) return NULL;
-	return ctx->create_socket();
-}
-
-// 设置 uTP 上下文级别的选项。
-// 支持的选项：UTP_LOG_NORMAL/UTP_LOG_MTU/UTP_LOG_DEBUG/UTP_TARGET_DELAY/UTP_SNDBUF/UTP_RCVBUF。
-// 参数 ctx - 上下文指针
-// 参数 opt - 选项名（UTP_* 枚举值）
-// 参数 val - 选项值（非 0/0 用于布尔选项，正整数用于缓冲区/延迟）
+// 设置 uTP 上下文级别的选项（UTP_LOG_*/UTP_TARGET_DELAY/UTP_SNDBUF/UTP_RCVBUF）
 // 返回: 0 表示成功，-1 表示 ctx 为 NULL 或 opt 未知
 int utp_context_set_option(utp_context *ctx, int opt, int val)
 {
@@ -470,42 +338,7 @@ int utp_context_set_option(utp_context *ctx, int opt, int val)
 	return ctx->set_option(opt, val);
 }
 
-int UtpContext::set_option(int opt, int val)
-{
-	switch (opt) {
-    	case UTP_LOG_NORMAL:
-			log_normal_ = val ? true : false;
-			return 0;
-
-    	case UTP_LOG_MTU:
-			log_mtu_ = val ? true : false;
-			return 0;
-
-    	case UTP_LOG_DEBUG:
-			log_debug_ = val ? true : false;
-			return 0;
-
-    	case UTP_TARGET_DELAY:
-			target_delay_ = val;
-			return 0;
-
-		case UTP_SNDBUF:
-			assert(val >= 1);
-			opt_sndbuf_ = val;
-			return 0;
-
-		case UTP_RCVBUF:
-			assert(val >= 1);
-			opt_rcvbuf_ = val;
-			return 0;
-	}
-	return -1;
-}
-
-// 获取 uTP 上下文级别选项的当前值。
-// 选项集与 utp_context_set_option 相同。
-// 参数 ctx - 上下文指针
-// 参数 opt - 选项名（UTP_* 枚举值）
+// 获取 uTP 上下文级别选项的当前值
 // 返回: 选项当前值；ctx 为 NULL 或 opt 未知时返回 -1
 int utp_context_get_option(utp_context *ctx, int opt)
 {
@@ -514,162 +347,48 @@ int utp_context_get_option(utp_context *ctx, int opt)
 	return ctx->get_option(opt);
 }
 
-int UtpContext::get_option(int opt)
+// ── socket 生命周期与连接 ───────────────────────────────────
+
+// 创建一个未初始化的 uTP socket
+utp_socket* utp_create_socket(utp_context *ctx)
 {
-	switch (opt) {
-    	case UTP_LOG_NORMAL:	return log_normal_ ? 1 : 0;
-    	case UTP_LOG_MTU:		return log_mtu_    ? 1 : 0;
-    	case UTP_LOG_DEBUG:		return log_debug_  ? 1 : 0;
-    	case UTP_TARGET_DELAY:	return target_delay_;
-		case UTP_SNDBUF:		return opt_sndbuf_;
-		case UTP_RCVBUF:		return opt_rcvbuf_;
-	}
-	return -1;
+	assert(ctx);
+	if (!ctx) return NULL;
+	return ctx->create_socket();
 }
 
-
-// 设置单个 uTP socket 级别的选项。
-// 支持的选项：UTP_SNDBUF/UTP_RCVBUF/UTP_TARGET_DELAY。
-// 必须在 socket 处于 CS_CONNECTED 之前调用以避免与并发传输冲突。
-// 参数 conn - socket 指针
-// 参数 opt - 选项名
-// 参数 val - 选项值
-// 返回: 0 表示成功，-1 表示 conn 为 NULL 或 opt 未知
-int utp_setsockopt(utp_socket *s, int opt, int val)
-{
-	assert(s);
-	if (!s) return -1;
-	return s->set_option(opt, val);
-}
-
-int UtpSocket::set_option(int opt, int val)
-{
-	switch (opt) {
-
-	case UTP_SNDBUF:
-		assert(val >= 1);
-		send_.opt_sndbuf = val;
-		return 0;
-
-	case UTP_RCVBUF:
-		assert(val >= 1);
-		recv_.opt_rcvbuf = val;
-		return 0;
-
-	case UTP_TARGET_DELAY:
-		conn_.target_delay = val;
-		return 0;
-	}
-
-	return -1;
-}
-
-// 获取单个 uTP socket 级别选项的当前值。
-// 参数 conn - socket 指针
-// 参数 opt - 选项名（UTP_SNDBUF/UTP_RCVBUF/UTP_TARGET_DELAY）
-// 返回: 选项当前值；conn 为 NULL 或 opt 未知时返回 -1
-int utp_getsockopt(utp_socket *s, int opt)
-{
-	assert(s);
-	if (!s) return -1;
-	return s->get_option(opt);
-}
-
-int UtpSocket::get_option(int opt)
-{
-	switch (opt) {
-		case UTP_SNDBUF:		return send_.opt_sndbuf;
-		case UTP_RCVBUF:		return recv_.opt_rcvbuf;
-		case UTP_TARGET_DELAY:	return conn_.target_delay;
-	}
-
-	return -1;
-}
-
-// 主动发起一次 uTP 连接（发送 SYN）。
-// 调用后 socket 状态由 CS_UNINITIALIZED 转为 CS_SYN_SENT，
-// 收到 SYN-ACK 后通过 UTP_STATE_CONNECT 事件回调通知用户。
-// 参数 conn - 由 utp_create_socket() 创建的未连接 socket
-// 参数 to - 对端地址
-// 参数 tolen - 对端地址长度
-// 返回: 0 表示成功发起；-1 表示 conn 为 NULL 或 socket 已处于非初始状态
-int UtpSocket::connect(const struct sockaddr *to, socklen_t tolen)
-{
-	assert(conn_.state == CS_UNINITIALIZED);
-	if (conn_.state != CS_UNINITIALIZED) {
-		conn_.state = CS_DESTROY;
-		return -1;
-	}
-
-	initialize(to, tolen, true, 0, 0, 1);
-
-	assert(send_.cur_window_packets == 0);
-	assert(send_.outbuf.get(send_.seq_nr) == NULL);
-	assert(sizeof(PacketFormatV1) == 20);
-
-	conn_.state = CS_SYN_SENT;
-	conn_.host->refresh_clock(this);
-
-	log(UTP_LOG_NORMAL, "UTP_Connect conn_seed_:%u packet_size:%u (B) "
-			"target_delay_:%u (ms) delay_history:%u "
-			"delay_base_history:%u (minutes)",
-			conn_.conn_seed, PACKET_SIZE, conn_.target_delay / 1000,
-			CUR_DELAY_SIZE, DELAY_BASE_HISTORY);
-
-	cc_->set_retransmit_timeout(3000);
-	cc_->set_rto_timeout(conn_.host->current_ms() + cc_->retransmit_timeout());
-	recv_.last_rcv_win = get_rcv_window();
-
-	send_.seq_nr = utp_call_get_random(conn_.host->handle(), this);
-
-	const size_t header_size = sizeof(PacketFormatV1);
-
-	OutgoingPacket *pkt = new OutgoingPacket();
-	pkt->data.resize(header_size);
-	PacketFormatV1* p1 = (PacketFormatV1*)pkt->data.data();
-
-	memset(p1, 0, header_size);
-	p1->set_version(1);
-	p1->set_type(ST_SYN);
-	p1->ext = 0;
-	p1->connid = conn_.conn_id_recv;
-	p1->windowsize = (uint32)recv_.last_rcv_win;
-	p1->seq_nr = send_.seq_nr;
-	pkt->transmissions = 0;
-	pkt->length = header_size;
-	pkt->payload = 0;
-
-	send_.outbuf.ensure_size(send_.seq_nr, send_.cur_window_packets);
-	send_.outbuf.put(send_.seq_nr, pkt);
-	send_.seq_nr++;
-	send_.cur_window_packets++;
-
-	#if UTP_DEBUG_LOGGING
-	log(UTP_LOG_DEBUG, "incrementing cur_window_packets_:%u", send_.cur_window_packets);
-	#endif
-
-	send_packet(pkt);
-	return 0;
-}
-
+// 主动发起一次 uTP 连接（发送 SYN）
 int utp_connect(utp_socket *s, const struct sockaddr *to, socklen_t tolen) {
 	assert(s);
 	if (!s) return -1;
 	return s->connect(to, tolen);
 }
 
-// -----------------------------------------------------------------------------
-// 函数：utp_writev
-// 功能：使用 scatter/gather I/O 向 uTP 连接写入多段不连续数据。
-//
-// 参数：
-//   conn         - 目标 socket 指针
-//   iovec_input  - iovec 数组，每项包含缓冲区地址和长度
-//   num_iovecs   - iovec 数组长度（上限 UTP_IOV_MAX）
-//
-// 返回值：
-//   成功入队的总字节数；socket 未连接或已发送 FIN 时返回 0；参数错误返回 -1
-// -----------------------------------------------------------------------------
+// 关闭 socket
+void utp_close(utp_socket *s) {
+	assert(s);
+	if (!s) return;
+	s->close();
+}
+
+// 关闭 socket 方向（SHUT_RD 关闭读、SHUT_WR 关闭写）
+void utp_shutdown(utp_socket *s, int how) {
+	assert(s);
+	if (!s) return;
+	s->shutdown(how);
+}
+
+// ── 数据读写 ───────────────────────────────────────────────
+
+// 写入数据到 uTP socket
+// 返回: 实际写入的字节数
+ssize_t utp_write(utp_socket *socket, void *buf, size_t len) {
+	struct utp_iovec iovec = { buf, len };
+	return utp_writev(socket, &iovec, 1);
+}
+
+// 使用 scatter/gather I/O 向 uTP 连接写入多段不连续数据
+// 返回: 成功入队的总字节数；socket 未连接或已发送 FIN 时返回 0；参数错误返回 -1
 ssize_t utp_writev(utp_socket *s, struct utp_iovec *iovec_input, size_t num_iovecs)
 {
 	assert(s);
@@ -684,196 +403,49 @@ ssize_t utp_writev(utp_socket *s, struct utp_iovec *iovec_input, size_t num_iove
 	return s->writev(iovec_input, num_iovecs);
 }
 
-ssize_t UtpSocket::writev(struct utp_iovec *iovec_input, size_t num_iovecs)
-{
-	static utp_iovec iovec[UTP_IOV_MAX];
-
-	if (num_iovecs > UTP_IOV_MAX)
-		num_iovecs = UTP_IOV_MAX;
-
-	memcpy(iovec, iovec_input, sizeof(struct utp_iovec)*num_iovecs);
-
-	size_t bytes = 0;
-	size_t sent = 0;
-	for (size_t i = 0; i < num_iovecs; i++)
-		bytes += iovec[i].iov_len;
-
-	#if UTP_DEBUG_LOGGING
-	size_t param = bytes;
-	#endif
-
-	if (!fsm().writable()) {
-		#if UTP_DEBUG_LOGGING
-		log(UTP_LOG_DEBUG, "UTP_Write %u bytes = false (not CS_CONNECTED)", (uint)bytes);
-		#endif
-		return 0;
-	}
-
-	if (send_.fin_sent) {
-		#if UTP_DEBUG_LOGGING
-		log(UTP_LOG_DEBUG, "UTP_Write %u bytes = false (fin_sent already)", (uint)bytes);
-		#endif
-		return 0;
-	}
-
-	conn_.host->refresh_clock(this);
-
-	size_t packet_size = get_packet_size();
-	size_t num_to_send = min<size_t>(bytes, packet_size);
-	while (!is_full(num_to_send)) {
-		bytes -= num_to_send;
-		sent  += num_to_send;
-
-		#if UTP_DEBUG_LOGGING
-		log(UTP_LOG_DEBUG, "Sending packet. seq_nr_:%u ack_nr_:%u wnd:%u/%u/%u rcv_win:%u size:%u cur_window_packets_:%u",
-			send_.seq_nr, recv_.ack_nr,
-			(uint)(cc_->cur_window() + num_to_send),
-			(uint)cc_->max_window(), (uint)send_.max_window_user,
-			(uint)recv_.last_rcv_win, num_to_send,
-			send_.cur_window_packets);
-		#endif
-		write_outgoing_packet(num_to_send, ST_DATA, iovec, num_iovecs);
-		num_to_send = min<size_t>(bytes, packet_size);
-
-		if (num_to_send == 0) {
-			#if UTP_DEBUG_LOGGING
-			log(UTP_LOG_DEBUG, "UTP_Write %u bytes = true", (uint)param);
-			#endif
-			return sent;
-		}
-	}
-
-	bool full = is_full();
-	if (full) {
-		conn_.state = CS_CONNECTED_FULL;
-	}
-
-	#if UTP_DEBUG_LOGGING
-	log(UTP_LOG_DEBUG, "UTP_Write %u bytes = %s", (uint)bytes, full ? "false" : "true");
-	#endif
-
-	return sent;
-}
-
-// -----------------------------------------------------------------------------
-// 函数：UtpSocket::read_drained
-// 功能：通知库应用已消费完数据，释放接收缓冲区。
-//
-// 参数：
-//   conn - socket 指针
-//
-// 返回值：无
-// -----------------------------------------------------------------------------
-void UtpSocket::read_drained()
-{
-	assert(conn_.state != CS_UNINITIALIZED);
-	if (conn_.state == CS_UNINITIALIZED) return;
-
-	const size_t rcvwin = get_rcv_window();
-
-	if (rcvwin > recv_.last_rcv_win) {
-		if (recv_.last_rcv_win == 0) {
-			send_ack();
-		} else {
-			conn_.host->refresh_clock(this);
-			schedule_ack();
-		}
-	}
-}
-
+// 通知库应用已消费完数据，释放接收缓冲区
 void utp_read_drained(utp_socket *s) {
 	assert(s);
 	if (!s) return;
 	s->read_drained();
 }
 
-// -----------------------------------------------------------------------------
-// 函数：UtpContext::issue_deferred_acks
-// 功能：触发延迟 ACK 发送。
-//
-// 参数：
-//   ctx - uTP 上下文指针
-//
-// 返回值：无
-// -----------------------------------------------------------------------------
-void UtpContext::issue_deferred_acks()
-{
-	for (size_t i = 0; i < ack_sockets_.size(); i++) {
-		UtpSocket *conn = ack_sockets_[i];
-		conn->send_ack();
-		i--;
-	}
-}
+// ── 定时驱动 ───────────────────────────────────────────────
 
+// 触发延迟 ACK 发送
 void utp_issue_deferred_acks(utp_context *ctx) {
 	assert(ctx);
 	if (!ctx) return;
 	ctx->issue_deferred_acks();
 }
 
-// -----------------------------------------------------------------------------
-// 函数：UtpContext::check_timeouts
-// 功能：周期性驱动库的定时器。
-//
-// 参数：
-//   ctx - uTP 上下文指针
-//
-// 返回值：无
-// -----------------------------------------------------------------------------
-void UtpContext::check_timeouts()
-{
-	current_ms_ = utp_call_get_milliseconds(this, NULL);
-
-	if (current_ms_ - last_check_ < TIMEOUT_CHECK_INTERVAL)
-		return;
-
-	last_check_ = current_ms_;
-
-	for (size_t i = 0; i < rst_info_.size(); i++) {
-		if ((int)(current_ms_ - rst_info_[i].timestamp) >= RST_INFO_TIMEOUT) {
-			rst_info_[i] = std::move(rst_info_.back());
-			rst_info_.pop_back();
-			i--;
-		}
-	}
-	if (rst_info_.size() != rst_info_.capacity()) {
-		rst_info_.shrink_to_fit();
-	}
-	std::vector<UtpSocket*> sockets;
-	sockets.reserve(sockets_.size());
-	for (auto& [key, socket] : sockets_) {
-		sockets.push_back(socket);
-	}
-	for (auto* conn : sockets) {
-		conn->check_timeouts();
-
-		if (conn->state() == CS_DESTROY) {
-			#if UTP_DEBUG_LOGGING
-			conn->log(UTP_LOG_DEBUG, "Destroying");
-			#endif
-			delete conn;
-		}
-	}
-}
-
+// 周期性驱动库的定时器
 void utp_check_timeouts(utp_context *ctx) {
 	assert(ctx);
 	if (!ctx) return;
 	ctx->check_timeouts();
 }
 
-// -----------------------------------------------------------------------------
-// 函数：utp_getpeername
-// 功能：获取对端地址。
-//
-// 参数：
-//   conn    - socket 指针
-//   addr    - 输出缓冲区，用于存储对端地址
-//   addrlen - 输入/输出参数，传入 addr 缓冲区大小，返回实际地址长度
-//
-// 返回值：
-//   0 表示成功；-1 表示参数错误或 socket 未初始化
-// -----------------------------------------------------------------------------
+// ── socket 属性与查询 ──────────────────────────────────────
+
+// 设置单个 uTP socket 级别的选项（UTP_SNDBUF/UTP_RCVBUF/UTP_TARGET_DELAY）
+int utp_setsockopt(utp_socket *s, int opt, int val)
+{
+	assert(s);
+	if (!s) return -1;
+	return s->set_option(opt, val);
+}
+
+// 获取单个 uTP socket 级别选项的当前值
+int utp_getsockopt(utp_socket *s, int opt)
+{
+	assert(s);
+	if (!s) return -1;
+	return s->get_option(opt);
+}
+
+// 获取对端地址
+// 返回: 0 表示成功；-1 表示参数错误或 socket 未初始化
 int utp_getpeername(utp_socket *conn, struct sockaddr *addr, socklen_t *addrlen)
 {
 	assert(addr);
@@ -888,31 +460,7 @@ int utp_getpeername(utp_socket *conn, struct sockaddr *addr, socklen_t *addrlen)
 	return conn->get_peername(addr, addrlen);
 }
 
-int UtpSocket::get_peername(struct sockaddr *addr_out, socklen_t *addrlen)
-{
-	assert(conn_.state != CS_UNINITIALIZED);
-	if (conn_.state == CS_UNINITIALIZED) return -1;
-
-	socklen_t len;
-	const SOCKADDR_STORAGE sa = conn_.addr.get_sockaddr_storage(&len);
-	*addrlen = min(len, *addrlen);
-	memcpy(addr_out, &sa, *addrlen);
-	return 0;
-}
-
-// -----------------------------------------------------------------------------
-// 函数：utp_get_delays
-// 功能：获取延迟测量值。
-//
-// 参数：
-//   conn   - socket 指针
-//   ours   - 输出参数，本端到对端的延迟（毫秒），可为 NULL
-//   theirs - 输出参数，对端到本端的延迟（毫秒），可为 NULL
-//   age    - 输出参数，距离上次测量延迟的时间（毫秒），可为 NULL
-//
-// 返回值：
-//   0 表示成功；-1 表示 socket 未初始化
-// -----------------------------------------------------------------------------
+// 获取延迟测量值（本端/对端单向延迟与测量时刻）
 int utp_get_delays(utp_socket *s, uint32 *ours, uint32 *theirs, uint32 *age)
 {
 	assert(s);
@@ -920,110 +468,14 @@ int utp_get_delays(utp_socket *s, uint32 *ours, uint32 *theirs, uint32 *age)
 	return s->get_delays(ours, theirs, age);
 }
 
-int UtpSocket::get_delays(uint32 *ours, uint32 *theirs, uint32 *age)
-{
-	assert(conn_.state != CS_UNINITIALIZED);
-	if (conn_.state == CS_UNINITIALIZED) {
-		if (ours)   *ours   = 0;
-		if (theirs) *theirs = 0;
-		if (age)    *age    = 0;
-		return -1;
-	}
-
-	if (ours)   *ours   = cc_->our_hist().get_value();
-	if (theirs) *theirs = cc_->their_hist().get_value();
-	if (age)    *age    = (uint32)(conn_.host->current_ms() - timing_.last_measured_delay);
-	return 0;
-}
-
-// -----------------------------------------------------------------------------
-// 函数：UtpSocket::close
-// 功能：关闭 socket。
-//
-// 参数：
-//   conn - socket 指针
-//
-// 返回值：无
-// -----------------------------------------------------------------------------
-void UtpSocket::close()
-{
-	assert(conn_.state != CS_UNINITIALIZED
-		&& conn_.state != CS_DESTROY);
-
-	#if UTP_DEBUG_LOGGING
-	log(UTP_LOG_DEBUG, "UTP_Close in state:%s", fsm().name());
-	#endif
-
-	// 行为按当前状态多态分派（State 模式）
-	fsm().close(*this);
-
-	#if UTP_DEBUG_LOGGING
-	log(UTP_LOG_DEBUG, "UTP_Close end in state:%s", fsm().name());
-	#endif
-}
-
-void utp_close(utp_socket *s) {
-	assert(s);
-	if (!s) return;
-	s->close();
-}
-
-// -----------------------------------------------------------------------------
-// 函数：UtpSocket::shutdown
-// 功能：关闭 socket 方向。
-//
-// 参数：
-//   conn - socket 指针
-//   how  - 关闭方向（SHUT_RD 关闭读、SHUT_WR 关闭写）
-//
-// 返回值：无
-// -----------------------------------------------------------------------------
-void UtpSocket::shutdown(int how)
-{
-	assert(conn_.state != CS_UNINITIALIZED
-		&& conn_.state != CS_DESTROY);
-
-	#if UTP_DEBUG_LOGGING
-	log(UTP_LOG_DEBUG, "UTP_shutdown(%d) in state:%s", how, fsm().name());
-	#endif
-
-	// 行为按当前状态多态分派（State 模式）
-	fsm().shutdown(*this, how);
-}
-
-void utp_shutdown(utp_socket *s, int how) {
-	assert(s);
-	if (!s) return;
-	s->shutdown(how);
-}
-
-// -----------------------------------------------------------------------------
-// 函数：utp_get_context
-// 功能：获取 socket 所属 context。
-//
-// 参数：
-//   socket - socket 指针
-//
-// 返回值：
-//   所属上下文指针；socket 为 NULL 时返回 NULL
-// -----------------------------------------------------------------------------
+// 获取 socket 所属 context
 utp_context* utp_get_context(utp_socket *socket) {
 	assert(socket);
 	if (!socket) return NULL;
 	return socket->context();
 }
 
-// -----------------------------------------------------------------------------
-// 函数：utp_set_userdata
-// 功能：设置用户数据。
-//
-// 参数：
-//   socket     - socket 指针
-//   userdata_  - 用户数据指针
-//
-// 返回值：
-//   设置后的用户数据指针；socket 为 NULL 时返回 NULL
-// -----------------------------------------------------------------------------
+// 设置 socket 用户数据，返回设置后的用户数据指针
 void* utp_set_userdata(utp_socket *socket, void *userdata) {
 	assert(socket);
 	if (!socket) return NULL;
@@ -1031,83 +483,14 @@ void* utp_set_userdata(utp_socket *socket, void *userdata) {
 	return socket->userdata();
 }
 
-// -----------------------------------------------------------------------------
-// 函数：utp_get_userdata
-// 功能：获取用户数据。
-//
-// 参数：
-//   socket - socket 指针
-//
-// 返回值：
-//   用户数据指针；socket 为 NULL 时返回 NULL
-// -----------------------------------------------------------------------------
+// 获取 socket 用户数据
 void* utp_get_userdata(utp_socket *socket) {
 	assert(socket);
 	if (!socket) return NULL;
 	return socket->userdata();
 }
 
-// -----------------------------------------------------------------------------
-// 函数：UtpContext::log
-// 功能：日志记录。根据日志级别决定是否输出日志。
-//
-// 参数：
-//   level  - 日志级别（UTP_LOG_NORMAL/UTP_LOG_MTU/UTP_LOG_DEBUG）
-//   socket - 关联的 socket 指针（可能为 nullptr）
-//   fmt    - printf 格式字符串
-//   ...    - 可变参数
-//
-// 返回值：无
-// -----------------------------------------------------------------------------
-void UtpContext::log(int level, utp_socket *socket, char const *fmt, ...)
-{
-	if (!would_log(level)) {
-		return;
-	}
-
-	va_list va;
-	va_start(va, fmt);
-	log_unchecked(socket, fmt, va);
-	va_end(va);
-}
-
-// -----------------------------------------------------------------------------
-// 函数：UtpContext::log_unchecked
-// 功能：无条件日志记录。不检查日志级别，直接格式化并输出日志。
-//
-// 参数：
-//   socket - 关联的 socket 指针（可能为 nullptr）
-//   fmt    - printf 格式字符串
-//   ...    - 可变参数
-//
-// 返回值：无
-// -----------------------------------------------------------------------------
-void UtpContext::log_unchecked(utp_socket *socket, char const *fmt, ...)
-{
-	va_list va;
-	char buf[4096];
-
-	va_start(va, fmt);
-	vsnprintf(buf, 4096, fmt, va);
-	buf[4095] = '\0';
-	va_end(va);
-
-	utp_call_log(this, socket, (const byte *)buf);
-}
-
-// 注：UtpContext::would_log 现为 utp_internal.h 中的内联定义
-// （供 UtpSocket::vlog 等多个翻译单元内联调用，避免跨 TU 未定义引用）。
-
-// -----------------------------------------------------------------------------
-// 函数：utp_get_stats
-// 功能：获取 socket 统计信息。
-//
-// 参数：
-//   socket - socket 指针
-//
-// 返回值：
-//   统计信息结构体指针；非 _DEBUG 编译时返回 NULL
-// -----------------------------------------------------------------------------
+// 获取 socket 统计信息（仅 _DEBUG 编译时有效，否则返回 NULL）
 utp_socket_stats* utp_get_stats(utp_socket *s)
 {
 	assert(s);
@@ -1115,30 +498,27 @@ utp_socket_stats* utp_get_stats(utp_socket *s)
 	return s->get_stats();
 }
 
-utp_socket_stats* UtpSocket::get_stats()
-{
-	#ifdef _DEBUG
-		stats_.mtu_guess = mtu_.raw_mtu();
-		return &stats_;
-	#else
-		return NULL;
-	#endif
-}
+// ── 入站数据投递 ───────────────────────────────────────────
 
+// 处理收到的 UDP 数据报
 int utp_process_udp(utp_context *ctx, const byte *buf, size_t len, const struct sockaddr *to, socklen_t tolen) {
 	assert(ctx);
 	if (!ctx) return 0;
 	return ctx->process_udp(buf, len, to, tolen);
 }
 
+// 处理 ICMP「需要分片」报文
 int utp_process_icmp_fragmentation(utp_context *ctx, const byte *buffer, size_t len, const struct sockaddr *to, socklen_t tolen, uint16 next_hop_mtu) {
 	assert(ctx);
 	if (!ctx) return 0;
 	return ctx->process_icmp_fragmentation(buffer, len, to, tolen, next_hop_mtu);
 }
 
+// 处理 ICMP 错误报文（目的不可达等）
 int utp_process_icmp_error(utp_context *ctx, const byte *buffer, size_t len, const struct sockaddr *to, socklen_t tolen) {
 	assert(ctx);
 	if (!ctx) return 0;
 	return ctx->process_icmp_error(buffer, len, to, tolen);
 }
+
+} // extern "C"

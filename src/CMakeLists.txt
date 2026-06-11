@@ -3,6 +3,7 @@ set(UTP_SOURCES
     utp_api.cpp
     utp_callbacks.cpp
     utp_callbacks_defaults.cpp
+    utp_context.cpp
     utp_process.cpp
     utp_socket.cpp
     utp/address.cpp
@@ -87,3 +88,49 @@ utp_set_warnings(utp)
 if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
     target_compile_options(utp PRIVATE -fno-exceptions)
 endif()
+
+# ── 安装与导出（使下游可 find_package(utp)）──────────────
+include(GNUInstallDirs)
+include(CMakePackageConfigHelpers)
+
+install(TARGETS utp
+    EXPORT  utpTargets
+    LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}
+    ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR}
+    RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
+)
+
+install(FILES
+    ${CMAKE_SOURCE_DIR}/include/utp.h
+    ${CMAKE_SOURCE_DIR}/include/utp_types.h
+    DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}
+)
+
+install(EXPORT utpTargets
+    FILE        utpTargets.cmake
+    NAMESPACE   utp::
+    DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/utp
+)
+
+# 生成并安装 utpConfig.cmake / utpConfigVersion.cmake
+configure_package_config_file(
+    ${CMAKE_SOURCE_DIR}/cmake/utpConfig.cmake.in
+    ${CMAKE_CURRENT_BINARY_DIR}/utpConfig.cmake
+    INSTALL_DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/utp
+)
+write_basic_package_version_file(
+    ${CMAKE_CURRENT_BINARY_DIR}/utpConfigVersion.cmake
+    VERSION       ${PROJECT_VERSION}
+    COMPATIBILITY SameMajorVersion
+)
+install(FILES
+    ${CMAKE_CURRENT_BINARY_DIR}/utpConfig.cmake
+    ${CMAKE_CURRENT_BINARY_DIR}/utpConfigVersion.cmake
+    DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/utp
+)
+
+# pkg-config 支持
+configure_file(${CMAKE_SOURCE_DIR}/cmake/libutp.pc.in
+               ${CMAKE_CURRENT_BINARY_DIR}/libutp.pc @ONLY)
+install(FILES ${CMAKE_CURRENT_BINARY_DIR}/libutp.pc
+        DESTINATION ${CMAKE_INSTALL_LIBDIR}/pkgconfig)
