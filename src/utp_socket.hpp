@@ -133,6 +133,9 @@ struct SendState {
 	bool close_requested_ : 1 = false;  // 用户是否请求关闭连接
 	size_t opt_sndbuf = 0;          // 发送缓冲区大小
 	size_t max_window_user = 0;     // 用户设定的最大发送窗口
+	// flush_packets 的已发送前缀游标：窗口内此序号之前的包均已确认或
+	// 已发送且无需重传，扫描可从此处开始（RTO 批量标记重传时重置回窗口头）
+	uint16 flush_scan_start = 1;
 	utp::SequenceBuffer<OutgoingPacket> outbuf;  // 出站序列缓冲区
 };
 
@@ -147,7 +150,7 @@ struct TimingState {
 	uint16 fast_resend_seq_nr = 1;  // 快速重传起始序列号
 };
 
-class UtpSocket : public utp::ILogger {
+struct UtpSocket : public utp::ILogger {
 public:
 	UtpSocket(ISocketHost* _host);
 	~UtpSocket() override;

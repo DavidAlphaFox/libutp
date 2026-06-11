@@ -580,24 +580,43 @@ bool UtpSocket::is_full(int bytes)
 //   false - 队列已清空或无需发送。
 //
 // 算法说明：
-//   1. 遍历 seq_nr_ - cur_window_packets_ 到 seq_nr_ 范围内的所有包。
-//   2. 跳过已发送且无需重传的包。
+//   1. 从已发送前缀游标 flush_scan_start（而非窗口头）开始遍历到 seq_nr_。
+//      游标不变量：窗口内序号在游标之前的包都「已确认(槽位为空) 或
+//      已发送且无需重传」，因此无需重复扫描。RTO 把在飞包批量标记
+//      need_resend 时会把游标重置回窗口头（见 check_timeouts）。
+//      此优化把基准里 O(窗口) 的每次扫描降为 O(待发包数)（热点占比 36% → ~0）。
+//   2. 跳过已发送且无需重传的包（同时推进游标）。
 //   3. 若发送窗口已满（is_full），立即返回 true。
 //   4. 对最后一个包，仅在它是唯一在飞包或 payload 已达 packet_size 时才发送，
-//      以便后续可能追加更多数据。
+//      以便后续可能追加更多数据（该包未发送，游标停在它之前）。
 // -----------------------------------------------------------------------------
 bool UtpSocket::flush_packets()
 {
 	size_t packet_size = get_packet_size();
-	for (uint16 i = send_.seq_nr - send_.cur_window_packets; i != send_.seq_nr; ++i) {
+	const uint16 window_start = send_.seq_nr - send_.cur_window_packets;
+
+	// 游标落在 [window_start, seq_nr] 之外（窗口推进/序号重随机化导致过期）则回退到窗口头
+	uint16 begin = send_.flush_scan_start;
+	if ((uint16)(begin - window_start) > send_.cur_window_packets)
+		begin = window_start;
+
+	bool in_prefix = true;  // 仍处于「可跳过前缀」中，可继续推进游标
+	for (uint16 i = begin; i != send_.seq_nr; ++i) {
 		OutgoingPacket *pkt = send_.outbuf.get(i);
-		if (pkt == 0 || (pkt->transmissions > 0 && pkt->need_resend == false)) continue;
+		if (pkt == 0 || (pkt->transmissions > 0 && pkt->need_resend == false)) {
+			if (in_prefix) send_.flush_scan_start = (uint16)(i + 1);
+			continue;
+		}
 		if (is_full()) return true;
 
 		if (i != ((send_.seq_nr - 1) & ACK_NR_MASK) ||
 			send_.cur_window_packets == 1 ||
 			pkt->payload >= packet_size) {
 			send_packet(pkt);
+			if (in_prefix) send_.flush_scan_start = (uint16)(i + 1);
+		} else {
+			// 末包暂不发送（等待追加凑满），游标不能越过它
+			in_prefix = false;
 		}
 	}
 	return false;
@@ -832,6 +851,8 @@ void UtpSocket::check_timeouts()
 				pkt->need_resend = true;
 				cc_->remove_in_flight(pkt->payload);
 			}
+			// 在飞包被批量标记重传，flush_packets 的已发送前缀游标失效，重置回窗口头
+			send_.flush_scan_start = send_.seq_nr - send_.cur_window_packets;
 			if (send_.cur_window_packets > 0) {
 				cc_->increment_retransmit_count();
 				log(UTP_LOG_NORMAL, "Packet timeout. Resend. seq_nr_:%u. timeout:%u "
@@ -1267,7 +1288,7 @@ int UtpSocket::connect(const struct sockaddr *to, socklen_t tolen)
 	log(UTP_LOG_NORMAL, "UTP_Connect conn_seed_:%u packet_size:%u (B) "
 			"target_delay_:%u (ms) delay_history:%u "
 			"delay_base_history:%u (minutes)",
-			conn_.conn_seed, PACKET_SIZE, conn_.target_delay / 1000,
+			conn_.conn_seed, (uint)PACKET_SIZE, (uint)(conn_.target_delay / 1000),
 			CUR_DELAY_SIZE, DELAY_BASE_HISTORY);
 
 	cc_->set_retransmit_timeout(3000);
