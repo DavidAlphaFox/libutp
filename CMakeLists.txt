@@ -24,11 +24,18 @@ option(UTP_BUILD_EXAMPLES   "构建示例程序（ucat）"         ON)
 option(UTP_DEBUG_LOGGING    "启用详细调试日志"          OFF)
 option(UTP_ENABLE_STATS     "启用 utp_get_stats() 和额外检查" OFF)
 option(UTP_SANITIZE         "启用 AddressSanitizer + UBSan（作用于全部目标）" OFF)
+option(UTP_BUILD_FUZZERS    "构建 libFuzzer 模糊测试目标（需 Clang）" OFF)
 
 # ── Sanitizers ────────────────────────────────────────────
 if(UTP_SANITIZE)
     add_compile_options(-fsanitize=address,undefined -fno-omit-frame-pointer)
     add_link_options(-fsanitize=address,undefined)
+endif()
+
+# fuzzer 覆盖率插桩作用于全部目标（库本体需要插桩反馈），
+# 但只链接 fuzz 目标自身带 -fsanitize=fuzzer（含 main）
+if(UTP_BUILD_FUZZERS)
+    add_compile_options(-fsanitize=fuzzer-no-link)
 endif()
 
 # ── 库 ───────────────────────────────────────────────────
@@ -44,4 +51,15 @@ option(BUILD_TESTING "构建测试" ON)
 if(BUILD_TESTING)
     enable_testing()
     add_subdirectory(tests)
+endif()
+
+# ── 模糊测试 ────────────────────────────────────────────────
+if(UTP_BUILD_FUZZERS)
+    add_subdirectory(fuzz)
+endif()
+
+# ── 基准测试 ────────────────────────────────────────────────
+option(UTP_BUILD_BENCH "构建吞吐基准（bench_loopback）" OFF)
+if(UTP_BUILD_BENCH)
+    add_subdirectory(bench)
 endif()
